@@ -1,5 +1,11 @@
 environment: dev
 
+preSyncCheck:
+  enabled: false
+
+rollout:
+  enabled: false
+
 image:
   repository: asia-south1-docker.pkg.dev/gke-prod-demo-001/demo-app/demo-app
   tag: "latest"

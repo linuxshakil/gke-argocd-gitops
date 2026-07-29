@@ -1,0 +1,41 @@
+# This patches Argo CD's built-in argocd-rbac-cm ConfigMap. Apply with:
+#   kubectl apply -f argocd-config/argocd-rbac-cm.yaml
+#
+# Layered on top of the per-AppProject roles in argocd-projects/*.yaml:
+# - AppProject roles answer "what can this identity do INSIDE this project?"
+# - This ConfigMap answers "what can this identity do ACROSS Argo CD as a whole?"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: argocd
+data:
+  policy.default: role:readonly # nobody gets write access by default — explicit grants only
+
+  policy.csv: |
+    # Platform/admin team — full control
+    g, gke-argocd-gitops:platform-admins, role:admin
+
+    # Developers — read everything, but can only sync/act inside the dev project
+    p, role:developer, applications, get, dev/*, allow
+    p, role:developer, applications, sync, dev/*, allow
+    p, role:developer, applications, action/*, dev/*, allow
+    g, gke-argocd-gitops:developers, role:developer
+
+    # QA — same shape, scoped to the test project
+    p, role:qa, applications, get, test/*, allow
+    p, role:qa, applications, sync, test/*, allow
+    g, gke-argocd-gitops:qa, role:qa
+
+    # Release managers — can view and sync prod, but can never delete an Application
+    p, role:release-manager, applications, get, prod/*, allow
+    p, role:release-manager, applications, sync, prod/*, allow
+    p, role:release-manager, applications, delete, prod/*, deny
+    g, gke-argocd-gitops:release-managers, role:release-manager
+
+  # Group membership above comes from your SSO/OIDC provider's claims (e.g.
+  # GitHub team membership via Dex). Without SSO configured, map real GCP-
+  # IAM-backed users to these groups manually here for a demo/single-user setup.
+  scopes: "[groups]"

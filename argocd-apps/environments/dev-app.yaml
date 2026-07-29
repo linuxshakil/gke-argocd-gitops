@@ -6,7 +6,7 @@ metadata:
 spec:
   project: dev
   source:
-    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    repoURL: https://github.com/linuxshakil/gke-argocd-gitops.git
     targetRevision: main # dev always tracks the tip of main — fastest feedback loop
     path: apps/demo-app
     helm:

@@ -1,0 +1,49 @@
+#############################################################
+# Terraform (bootstrap/)
+#############################################################
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform.tfstate.lock.info
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+#############################################################
+# Helm
+#############################################################
+apps/**/charts/
+apps/**/*.tgz
+
+#############################################################
+# Python (app-src/)
+#############################################################
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+#############################################################
+# Credentials / keys — extra safety net (this repo uses WIF)
+#############################################################
+*.pem
+*.key
+service-account*.json
+kubeconfig
+.kube/config
+
+#############################################################
+# OS / editor junk
+#############################################################
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

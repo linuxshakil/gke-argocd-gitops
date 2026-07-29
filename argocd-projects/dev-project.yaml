@@ -7,7 +7,7 @@ spec:
   description: "Dev environment — fastest iteration, auto-sync allowed"
 
   sourceRepos:
-    - "https://github.com/<you>/gke-argocd-gitops.git"
+    - "https://github.com/linuxshakil/gke-argocd-gitops.git"
 
   destinations:
     - namespace: dev
@@ -20,6 +20,8 @@ spec:
   namespaceResourceWhitelist:
     - group: "apps"
       kind: Deployment
+    - group: "batch"
+      kind: Job
     - group: ""
       kind: Service
     - group: ""

@@ -3,10 +3,13 @@ kind: Application
 metadata:
   name: demo-app-prod
   namespace: argocd
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: prod-incidents
+    notifications.argoproj.io/subscribe.on-deployed.slack: prod-releases
 spec:
   project: prod
   source:
-    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    repoURL: https://github.com/linuxshakil/gke-argocd-gitops.git
     targetRevision: prod # a dedicated branch, promoted from `test` via Pull Request + a tagged release
     path: apps/demo-app
     helm:
@@ -15,6 +18,15 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: prod
+  # The HPA constantly changes .spec.replicas outside of Git. Without this,
+  # Argo CD would show prod as permanently "OutOfSync" (or worse, selfHeal
+  # would fight the HPA every few seconds). ignoreDifferences tells Argo CD
+  # "don't treat this specific field as drift."
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas
   # NOTE: no `syncPolicy.automated` block here on purpose.
   # Prod is sync-on-demand only — a release manager (see prod-project.yaml's
   # RBAC role) must run `argocd app sync demo-app-prod` (or click Sync in the

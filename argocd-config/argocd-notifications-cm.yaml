@@ -1,0 +1,49 @@
+# Patches the argocd-notifications-cm ConfigMap + subscribes each
+# Application via annotations. Apply with:
+#   kubectl apply -f argocd-config/argocd-notifications-cm.yaml
+#
+# Requires a Slack secret first:
+#   kubectl create secret generic argocd-notifications-secret -n argocd \
+#     --from-literal=slack-token=<xoxb-your-slack-bot-token>
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  service.slack: |
+    token: $slack-token
+
+  template.app-sync-failed: |
+    message: |
+      :x: *{{.app.metadata.name}}* sync FAILED in *{{.app.spec.destination.namespace}}*.
+      Revision: {{.app.status.sync.revision}}
+      <{{.context.argocdUrl}}/applications/{{.app.metadata.name}}|View in Argo CD>
+
+  template.app-deployed: |
+    message: |
+      :white_check_mark: *{{.app.metadata.name}}* deployed to *{{.app.spec.destination.namespace}}*.
+      Revision: {{.app.status.sync.revision}}
+
+  trigger.on-sync-failed: |
+    - when: app.status.operationState.phase in ['Error', 'Failed']
+      send: [app-sync-failed]
+
+  trigger.on-deployed: |
+    - when: app.status.operationState.phase == 'Succeeded' and app.status.health.status == 'Healthy'
+      send: [app-deployed]
+
+  subscriptions: |
+    - recipients:
+        - slack:platform-alerts
+      triggers:
+        - on-sync-failed
+        - on-deployed
+
+# NOTE: prod additionally gets its own dedicated, higher-signal Slack
+# channel. Rather than patching the Application here (which would fight
+# with Argo CD's own management of that object), the two annotations below
+# are added directly onto argocd-apps/environments/prod-app.yaml's metadata:
+#
+#   notifications.argoproj.io/subscribe.on-sync-failed.slack: prod-incidents
+#   notifications.argoproj.io/subscribe.on-deployed.slack: prod-releases

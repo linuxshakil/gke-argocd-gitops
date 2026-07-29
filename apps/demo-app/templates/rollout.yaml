@@ -1,6 +1,6 @@
-{{- if not .Values.rollout.enabled }}
-apiVersion: apps/v1
-kind: Deployment
+{{- if .Values.rollout.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
 metadata:
   name: {{ include "demo-app.fullname" . }}
   labels:
@@ -45,16 +45,12 @@ spec:
               port: {{ .Values.service.targetPort }}
             initialDelaySeconds: 15
             periodSeconds: 20
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+  # This is the entire point of using a Rollout instead of a Deployment:
+  # traffic shifts gradually to the new version, pausing at each step so a
+  # human (or an automated analysis run, in a fuller setup) can bail out
+  # before 100% of prod traffic ever sees a bad release.
+  strategy:
+    canary:
+      steps:
+        {{- toYaml .Values.rollout.steps | nindent 8 }}
 {{- end }}

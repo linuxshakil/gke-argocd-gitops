@@ -1,0 +1,72 @@
+name: CI - Build, Scan & Deploy to Dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app-src/**"
+
+permissions:
+  id-token: write   # Workload Identity Federation — same keyless pattern as the infra repo
+  contents: write    # needed to commit the bumped image tag back into this repo
+
+env:
+  PROJECT_ID: gke-prod-demo-001
+  REGION: asia-south1
+  REPO: demo-app
+
+jobs:
+  build-scan-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build image
+        id: build
+        run: |
+          IMAGE_TAG="dev-${GITHUB_SHA::7}"
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${IMAGE_TAG}"
+          docker build -t "$IMAGE" ./app-src
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      # Fail the pipeline on HIGH/CRITICAL vulnerabilities BEFORE the image
+      # ever gets pushed — a real supply-chain security gate, not just a report.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      - name: Push image (only reached if the scan passed)
+        run: docker push ${{ steps.build.outputs.image }}
+
+      - name: Bump values-dev.yaml with the new image tag (the actual GitOps trigger)
+        run: |
+          sed -i "s/tag: .*/tag: \"${{ steps.build.outputs.image_tag }}\"/" apps/demo-app/values-dev.yaml
+
+      - name: Commit and push the bumped values file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/demo-app/values-dev.yaml
+          git commit -m "ci: bump demo-app dev image to ${{ steps.build.outputs.image_tag }} [skip ci]"
+          git push origin main
+
+      # No `kubectl apply`, no `helm upgrade`, no cluster credentials used
+      # here at all. Argo CD is already watching this repo — the commit
+      # above is the only "deploy" action this pipeline ever performs.

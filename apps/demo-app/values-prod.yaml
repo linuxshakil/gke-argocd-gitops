@@ -1,5 +1,17 @@
 environment: prod
 
+preSyncCheck:
+  enabled: true
+
+rollout:
+  enabled: true
+  steps:
+    - setWeight: 20
+    - pause: { duration: 60 }
+    - setWeight: 50
+    - pause: { duration: 120 }
+    - setWeight: 100
+
 image:
   tag: "v1.0.0" # prod NEVER tracks "latest" — always an explicit, immutable version tag
 

@@ -1,0 +1,57 @@
+# NOT applied by default in this repo — argocd-apps/root-app.yaml (App of
+# Apps) is the pattern actually in use. This file exists so this repo also
+# demonstrates the OTHER common Argo CD multi-environment pattern, since
+# "App of Apps vs ApplicationSet, and when would you choose each" is a very
+# common advanced interview question.
+#
+# App of Apps (used here): explicit, one YAML file per environment, full
+#   control over each Application's fields (different syncPolicy, different
+#   ignoreDifferences, different notification channels per env, as seen in
+#   this repo's prod-app.yaml). Best when environments are FEW and genuinely
+#   DIFFERENT from each other.
+#
+# ApplicationSet (below): ONE generator template stamps out N Applications
+#   automatically. Best when you have MANY near-identical targets (e.g. 30
+#   microservices, or 10 customer clusters) where per-target customization
+#   would just be repetitive copy-paste.
+#
+# To actually use this instead, apply it and remove argocd-apps/root-app.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: demo-app-set
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            project: dev
+            targetRevision: main
+            autoSync: "true"
+          - env: test
+            project: test
+            targetRevision: test
+            autoSync: "true"
+          - env: prod
+            project: prod
+            targetRevision: prod
+            autoSync: "false" # ApplicationSet still can't easily express "no automated block at all"
+                               # per-element without goTemplate + sprig conditionals — this is
+                               # exactly the kind of awkwardness that makes explicit App-of-Apps
+                               # files simpler for prod's genuinely-different sync policy.
+  template:
+    metadata:
+      name: "demo-app-{{env}}"
+    spec:
+      project: "{{project}}"
+      source:
+        repoURL: https://github.com/linuxshakil/gke-argocd-gitops.git
+        targetRevision: "{{targetRevision}}"
+        path: apps/demo-app
+        helm:
+          valueFiles:
+            - "values-{{env}}.yaml"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{env}}"

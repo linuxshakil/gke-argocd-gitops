@@ -31,5 +31,5 @@ variable "argocd_chart_version" {
 
 variable "gitops_repo_url" {
   type        = string
-  description = "HTTPS URL of THIS gitops repo, e.g. https://github.com/<you>/gke-argocd-gitops.git"
+  description = "HTTPS URL of THIS gitops repo, e.g. https://github.com/linuxshakil/gke-argocd-gitops.git"
 }

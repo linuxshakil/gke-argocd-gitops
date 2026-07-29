@@ -12,7 +12,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    repoURL: https://github.com/linuxshakil/gke-argocd-gitops.git
     targetRevision: main
     path: argocd-apps/environments
   destination:

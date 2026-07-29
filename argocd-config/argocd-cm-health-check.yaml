@@ -1,0 +1,36 @@
+# Patches the argocd-cm ConfigMap with a custom health check written in Lua.
+# Apply with: kubectl apply -f argocd-config/argocd-cm-health-check.yaml
+#
+# WHY THIS IS NEEDED: Argo CD ships with built-in health checks for common
+# kinds (Deployment, Service, Ingress...) but has NO idea how to read the
+# health of many CRDs out of the box. Argo Rollouts' `Rollout` kind is
+# actually a known exception (Argo CD understands it natively) — but this
+# file demonstrates the general mechanism using a Job as the example,
+# because "how would you teach Argo CD to health-check a CRD it's never
+# seen before" is a real advanced-interview question, and Job is a kind
+# everyone already knows the fields of.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: argocd
+data:
+  resource.customizations.health.batch_Job: |
+    hs = {}
+    if obj.status ~= nil then
+      if obj.status.succeeded ~= nil and obj.status.succeeded > 0 then
+        hs.status = "Healthy"
+        hs.message = "Job completed successfully"
+        return hs
+      end
+      if obj.status.failed ~= nil and obj.status.failed > 0 then
+        hs.status = "Degraded"
+        hs.message = "Job failed"
+        return hs
+      end
+    end
+    hs.status = "Progressing"
+    hs.message = "Job still running"
+    return hs

@@ -1,5 +1,8 @@
 environment: test
 
+preSyncCheck:
+  enabled: true
+
 image:
   tag: "test-latest" # bumped by ci.yml when main is promoted into the test branch
 
