@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-prod
+  namespace: argocd
+spec:
+  project: prod
+  source:
+    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    targetRevision: prod # a dedicated branch, promoted from `test` via Pull Request + a tagged release
+    path: apps/demo-app
+    helm:
+      valueFiles:
+        - values-prod.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+  # NOTE: no `syncPolicy.automated` block here on purpose.
+  # Prod is sync-on-demand only — a release manager (see prod-project.yaml's
+  # RBAC role) must run `argocd app sync demo-app-prod` (or click Sync in the
+  # UI) after reviewing the diff. Git still stays the single source of truth;
+  # only the moment of actually applying it to the cluster requires a human.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false

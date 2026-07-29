@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-dev
+  namespace: argocd
+spec:
+  project: dev
+  source:
+    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    targetRevision: main # dev always tracks the tip of main — fastest feedback loop
+    path: apps/demo-app
+    helm:
+      valueFiles:
+        - values-dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dev
+  syncPolicy:
+    automated:
+      prune: true    # remove resources that got deleted from Git
+      selfHeal: true  # if someone manually kubectl-edits something, revert it back to match Git
+    syncOptions:
+      - CreateNamespace=false # namespace is already created by bootstrap/namespaces.tf

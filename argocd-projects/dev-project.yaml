@@ -1,0 +1,40 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dev
+  namespace: argocd
+spec:
+  description: "Dev environment — fastest iteration, auto-sync allowed"
+
+  sourceRepos:
+    - "https://github.com/<you>/gke-argocd-gitops.git"
+
+  destinations:
+    - namespace: dev
+      server: https://kubernetes.default.svc
+
+  # Which kinds of cluster-scoped resources this project's Applications may
+  # touch. Kept empty on purpose — dev apps only manage namespaced resources.
+  clusterResourceWhitelist: []
+
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "networking.k8s.io"
+      kind: Ingress
+
+  roles:
+    - name: developer
+      description: "Full sync/manage rights inside the dev namespace only"
+      policies:
+        - p, proj:dev:developer, applications, *, dev/*, allow
+      groups:
+        - "gke-argocd-gitops:developers"

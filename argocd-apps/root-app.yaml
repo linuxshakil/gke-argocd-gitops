@@ -1,0 +1,26 @@
+# This is the ONLY Application you ever apply by hand (once, via kubectl or
+# the ArgoCD UI). It watches argocd-apps/environments/ in this same repo and
+# automatically creates/updates/removes the dev, test, and prod Applications
+# below whenever this folder changes — that's the "App of Apps" pattern.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    targetRevision: main
+    path: argocd-apps/environments
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

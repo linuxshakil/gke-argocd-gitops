@@ -1,0 +1,20 @@
+environment: dev
+
+image:
+  tag: "dev-latest" # bumped automatically by ci.yml on every push to main
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 150m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+
+ingress:
+  enabled: false

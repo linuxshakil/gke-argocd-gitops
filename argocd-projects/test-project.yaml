@@ -1,0 +1,38 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: test
+  namespace: argocd
+spec:
+  description: "Test/staging — mirrors prod shape, still auto-synced for fast QA feedback"
+
+  sourceRepos:
+    - "https://github.com/<you>/gke-argocd-gitops.git"
+
+  destinations:
+    - namespace: test
+      server: https://kubernetes.default.svc
+
+  clusterResourceWhitelist: []
+
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "networking.k8s.io"
+      kind: Ingress
+
+  roles:
+    - name: qa
+      description: "Sync/manage rights inside the test namespace only"
+      policies:
+        - p, proj:test:qa, applications, *, test/*, allow
+      groups:
+        - "gke-argocd-gitops:qa"

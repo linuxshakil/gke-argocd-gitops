@@ -1,0 +1,29 @@
+environment: prod
+
+image:
+  tag: "v1.0.0" # prod NEVER tracks "latest" — always an explicit, immutable version tag
+
+replicaCount: 3
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+
+ingress:
+  enabled: true
+  host: "yourdomain.com"
+  className: "gce"
+
+podAnnotations:
+  "prometheus.io/scrape": "true"
+  "prometheus.io/port": "8080"

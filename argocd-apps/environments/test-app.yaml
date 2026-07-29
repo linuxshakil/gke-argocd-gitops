@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-test
+  namespace: argocd
+spec:
+  project: test
+  source:
+    repoURL: https://github.com/<you>/gke-argocd-gitops.git
+    targetRevision: test # a dedicated long-lived branch — promoted from main via Pull Request
+    path: apps/demo-app
+    helm:
+      valueFiles:
+        - values-test.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: test
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

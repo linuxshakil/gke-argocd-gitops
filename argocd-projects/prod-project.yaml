@@ -1,0 +1,46 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: prod
+  namespace: argocd
+spec:
+  description: "Production — manual sync only, tightest RBAC, deletion blocked"
+
+  sourceRepos:
+    - "https://github.com/<you>/gke-argocd-gitops.git"
+
+  destinations:
+    - namespace: prod
+      server: https://kubernetes.default.svc
+
+  clusterResourceWhitelist: []
+
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "networking.k8s.io"
+      kind: Ingress
+
+  # Nobody — not even an admin using the CLI by accident — can delete an
+  # Application object bound to this project without first removing this
+  # finalizer rule, an explicit, deliberate action.
+  orphanedResources:
+    warn: true
+
+  roles:
+    - name: release-manager
+      description: "Can view + manually trigger sync, cannot delete Applications"
+      policies:
+        - p, proj:prod:release-manager, applications, get, prod/*, allow
+        - p, proj:prod:release-manager, applications, sync, prod/*, allow
+        - p, proj:prod:release-manager, applications, delete, prod/*, deny
+      groups:
+        - "gke-argocd-gitops:release-managers"

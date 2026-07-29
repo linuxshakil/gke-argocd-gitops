@@ -1,0 +1,25 @@
+environment: test
+
+image:
+  tag: "test-latest" # bumped by ci.yml when main is promoted into the test branch
+
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+ingress:
+  enabled: true
+  host: "test.yourdomain.com"
+  className: "gce"
