@@ -112,7 +112,7 @@ gke-argocd-gitops/
 
 - The GKE cluster from the separate `gke-infra-terraform` repo already exists and is reachable
 - `kubectl`, `helm`, `terraform`, and the [Argo CD CLI](https://argo-cd.readthedocs.io/en/stable/cli_installation/) installed locally
-- A GitHub repo (this one) with `GCP_WIF_PROVIDER` / `GCP_SERVICE_ACCOUNT` secrets configured, same keyless pattern as the infra repo
+- `GCP_WIF_PROVIDER` / `GCP_SERVICE_ACCOUNT` GitHub secrets configured **for THIS repo specifically** — do not reuse the infra repo's secrets, they won't work here. This repo has its own dedicated `bootstrap/wif.tf` (a separate Workload Identity Pool, trusting only this repository) — see [Section 6](#6-setting-up-cicd-secrets-workload-identity-federation) for the exact commands.
 
 ---
 
