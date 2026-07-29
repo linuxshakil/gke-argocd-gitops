@@ -20,8 +20,8 @@
 
 resource "google_iam_workload_identity_pool" "gitops_ci" {
   workload_identity_pool_id = "gitops-ci-pool"
-  display_name              = "GitOps CI Pool (gke-argocd-gitops)"
-  description                = "Trusts GitHub Actions OIDC tokens from ONLY the gke-argocd-gitops repo"
+  display_name              = "GitOps CI Pool" # must be <= 32 chars — GCP hard limit
+  description               = "Trusts GitHub Actions OIDC tokens from ONLY the linuxshakil/gke-argocd-gitops repo"
 }
 
 resource "google_iam_workload_identity_pool_provider" "github" {
@@ -58,8 +58,8 @@ resource "google_project_iam_member" "gitops_ci_artifact_writer" {
 
 resource "google_service_account_iam_member" "gitops_ci_wif_binding" {
   service_account_id = google_service_account.gitops_ci.name
-  role                = "roles/iam.workloadIdentityUser"
-  member              = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.gitops_ci.name}/attribute.repository/linuxshakil/gke-argocd-gitops"
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.gitops_ci.name}/attribute.repository/linuxshakil/gke-argocd-gitops"
 }
 
 output "gitops_ci_service_account_email" {

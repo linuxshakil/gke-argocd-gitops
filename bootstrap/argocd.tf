@@ -15,6 +15,14 @@ resource "helm_release" "argocd" {
   namespace        = kubernetes_namespace.argocd.metadata[0].name
   create_namespace = false
 
+  # Argo CD installs ~7 components (server, repo-server, application-
+  # controller, redis, dex-server, notifications-controller, applicationset-
+  # controller). On a small/shared node pool (this cluster also runs
+  # WordPress), pulling every image and reaching Ready can take longer than
+  # Helm's 300s default — bump it generously rather than fighting flaky
+  # timeouts on every apply.
+  timeout = 600
+
   # Production-grade settings — kept minimal and explicit rather than
   # accepting every chart default.
   values = [
@@ -36,7 +44,7 @@ resource "helm_release" "argocd" {
         replicas = 1
       }
       repoServer = {
-        replicas = 2 # HA for the component that actually renders Helm/Kustomize manifests
+        replicas = 1 # start at 1 on a small/shared cluster; bump to 2 for HA once you have node capacity to spare
       }
     })
   ]
