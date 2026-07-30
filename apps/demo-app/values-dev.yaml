@@ -1,7 +1,7 @@
 environment: dev
 
 image:
-  tag: "dev-latest" # bumped automatically by ci.yml on every push to main
+  tag: "dev-0569a5d"
 
 replicaCount: 1
 
