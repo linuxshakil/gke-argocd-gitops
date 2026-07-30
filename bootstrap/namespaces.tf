@@ -30,7 +30,7 @@ resource "kubernetes_namespace" "env" {
   metadata {
     name = each.key
     labels = {
-      "environment"                          = each.key
+      "environment"                         = each.key
       "argocd.argoproj.io/managed-by-argocd" = "true"
     }
   }

@@ -32,6 +32,15 @@ resource "helm_release" "argocd" {
           "server.insecure" = true # TLS terminates at the GKE Ingress/BackendConfig, not at Argo CD's own pod
         }
       }
+
+      # Dex (SSO) isn't wired up yet — see README's Future Improvements. On a
+      # small/shared cluster, running a component nobody is using yet just
+      # burns CPU/memory that the pods we actually need are starved for.
+      # Re-enable this once SSO is actually configured.
+      dex = {
+        enabled = false
+      }
+
       server = {
         # Argo CD's own UI is exposed later via a normal Kubernetes Service +
         # Ingress, following the exact same BackendConfig/ManagedCertificate
@@ -39,12 +48,42 @@ resource "helm_release" "argocd" {
         service = {
           type = "ClusterIP"
         }
+        resources = {
+          requests = { cpu = "50m", memory = "128Mi" }
+          limits   = { cpu = "200m", memory = "256Mi" }
+        }
       }
       controller = {
         replicas = 1
+        resources = {
+          requests = { cpu = "100m", memory = "256Mi" }
+          limits   = { cpu = "500m", memory = "512Mi" }
+        }
       }
       repoServer = {
         replicas = 1 # start at 1 on a small/shared cluster; bump to 2 for HA once you have node capacity to spare
+        resources = {
+          requests = { cpu = "100m", memory = "256Mi" }
+          limits   = { cpu = "500m", memory = "512Mi" }
+        }
+      }
+      redis = {
+        resources = {
+          requests = { cpu = "50m", memory = "64Mi" }
+          limits   = { cpu = "200m", memory = "128Mi" }
+        }
+      }
+      notifications = {
+        resources = {
+          requests = { cpu = "50m", memory = "64Mi" }
+          limits   = { cpu = "200m", memory = "128Mi" }
+        }
+      }
+      applicationSet = {
+        resources = {
+          requests = { cpu = "50m", memory = "128Mi" }
+          limits   = { cpu = "200m", memory = "256Mi" }
+        }
       }
     })
   ]
@@ -85,4 +124,13 @@ resource "helm_release" "argo_rollouts" {
   version          = "2.37.7"
   namespace        = kubernetes_namespace.argo_rollouts.metadata[0].name
   create_namespace = false
+
+  values = [
+    yamlencode({
+      resources = {
+        requests = { cpu = "50m", memory = "64Mi" }
+        limits   = { cpu = "200m", memory = "128Mi" }
+      }
+    })
+  ]
 }

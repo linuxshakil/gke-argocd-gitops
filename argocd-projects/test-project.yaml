@@ -28,8 +28,12 @@ spec:
       kind: Secret
     - group: "autoscaling"
       kind: HorizontalPodAutoscaler
+    - group: ""
+      kind: ServiceAccount
     - group: "networking.k8s.io"
       kind: Ingress
+    - group: "networking.gke.io"
+      kind: ManagedCertificate
 
   roles:
     - name: qa

@@ -30,8 +30,12 @@ spec:
       kind: Secret
     - group: "autoscaling"
       kind: HorizontalPodAutoscaler
+    - group: ""
+      kind: ServiceAccount
     - group: "networking.k8s.io"
       kind: Ingress
+    - group: "networking.gke.io"
+      kind: ManagedCertificate
 
   # Nobody — not even an admin using the CLI by accident — can delete an
   # Application object bound to this project without first removing this
