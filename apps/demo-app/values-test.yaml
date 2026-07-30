@@ -4,7 +4,7 @@ preSyncCheck:
   enabled: true
 
 image:
-  tag: "test-latest" # bumped by ci.yml when main is promoted into the test branch
+  tag: "dev-a1b2c3d"
 
 replicaCount: 2
 
