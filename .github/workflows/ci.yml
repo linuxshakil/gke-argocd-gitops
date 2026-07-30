@@ -2,7 +2,7 @@ name: CI - Build, Scan & Deploy to Dev
 
 on:
   push:
-    branches: [main]
+    branches: [develop]
     paths:
       - "app-src/**"
 
@@ -71,7 +71,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add apps/demo-app/values-dev.yaml
           git commit -m "ci: bump demo-app dev image to ${{ steps.build.outputs.image_tag }} [skip ci]"
-          git push origin main
+          git push origin develop
 
       # No `kubectl apply`, no `helm upgrade`, no cluster credentials used
       # here at all. Argo CD is already watching this repo — the commit

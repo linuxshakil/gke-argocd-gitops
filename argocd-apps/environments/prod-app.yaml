@@ -10,7 +10,7 @@ spec:
   project: prod
   source:
     repoURL: https://github.com/linuxshakil/gke-argocd-gitops.git
-    targetRevision: prod # a dedicated branch, promoted from `test` via Pull Request + a tagged release
+    targetRevision: main # protected branch, only reached via a reviewed PR from `test`
     path: apps/demo-app
     helm:
       valueFiles:
