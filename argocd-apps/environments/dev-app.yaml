@@ -7,7 +7,7 @@ spec:
   project: dev
   source:
     repoURL: https://github.com/linuxshakil/gke-argocd-gitops.git
-    targetRevision: main # dev always tracks the tip of main — fastest feedback loop
+    targetRevision: develop # dev always tracks the tip of develop — fastest feedback loop
     path: apps/demo-app
     helm:
       valueFiles:

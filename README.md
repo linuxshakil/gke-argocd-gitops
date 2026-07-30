@@ -212,18 +212,35 @@ kubectl apply -f argocd-apps/root-app.yaml
 
 ## 8. Promotion Flow — Dev to Prod
 
+### Branching Strategy
+
 ```
-1. Push to `main` (app-src/** changed)
+develop  →  Application: demo-app-dev   →  dev namespace   →  AUTO-sync
+test     →  Application: demo-app-test  →  test namespace  →  AUTO-sync
+main     →  Application: demo-app-prod  →  prod namespace  →  MANUAL sync
+```
+
+`main` is the protected, production branch here — same convention GitHub itself assumes by default (branch protection, required reviews, required status checks all make sense on `main` specifically because it now genuinely represents "what's in production"). `develop` is where day-to-day CI activity happens; `test` and `main` are only ever reached through a reviewed Pull Request, never a direct push.
+
+Recommended GitHub branch protection:
+- `develop`: no protection needed — CI pushes here directly, meant to be fast and disposable
+- `test`: require a PR (no direct pushes) — at least one reviewer
+- `main`: require a PR + at least one reviewer + required CI status checks passing — this is production
+
+### The Flow
+
+```
+1. Push to `develop` (app-src/** changed)
      → CI builds the image, Trivy-scans it, pushes it, bumps values-dev.yaml
      → Argo CD auto-syncs demo-app-dev (PreSync hook is disabled in dev, so it's instant)
 
-2. Verify in dev → open PR: main → test branch
+2. Verify in dev → open PR: develop → test
      → merge → Argo CD auto-syncs demo-app-test
      → the PreSync Job hook runs FIRST (sync-wave -1), THEN the Deployment updates
 
-3. QA signs off in test → open PR: test → prod branch
+3. QA signs off in test → open PR: test → main
      → bump values-prod.yaml to an explicit, immutable tag (e.g. v1.2.0 — never "latest")
-     → merge → demo-app-prod shows OutOfSync, but does NOT auto-apply
+     → merge (requires review + passing checks) → demo-app-prod shows OutOfSync, but does NOT auto-apply
 
 4. A release manager reviews the diff:
      argocd app diff demo-app-prod
@@ -238,6 +255,10 @@ kubectl apply -f argocd-apps/root-app.yaml
      kubectl argo rollouts abort demo-app-prod -n prod
    rolls back immediately to the last known-good version — no new Git commit needed.
 ```
+
+### A Note on `root-app.yaml`
+
+Unlike `demo-app-dev`/`test`/`prod` (whose `source.targetRevision` follows the branch table above), `argocd-apps/root-app.yaml` itself always tracks `main` — because it defines the Argo CD **platform configuration** (which environments exist, their sync policies, RBAC boundaries). Changes to that shape deserve the same review rigor as a production release, regardless of which branch an individual app deployment is promoted through.
 
 ---
 
@@ -372,5 +393,5 @@ kubectl get secret argocd-notifications-secret -n argocd
 - [ ] Add an `AnalysisTemplate` (Argo Rollouts) so canary promotion is gated on real metrics (error rate, latency) instead of a fixed timer
 - [ ] Add Argo CD's own Ingress + ManagedCertificate instead of `kubectl port-forward`
 - [ ] Add `argocd-image-updater` as an alternative to the CI-commits-a-tag-bump pattern currently used for dev
-- [ ] Add branch protection rules on `test`/`prod` requiring PR review before merge
+- [ ] Add branch protection rules on `test`/`main` requiring PR review + passing status checks before merge (`main` = production, deserves the strictest rule)
 - [ ] Add a second GKE cluster and demonstrate ApplicationSet's cluster generator for genuine multi-cluster delivery

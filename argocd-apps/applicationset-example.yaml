@@ -27,7 +27,7 @@ spec:
         elements:
           - env: dev
             project: dev
-            targetRevision: main
+            targetRevision: develop
             autoSync: "true"
           - env: test
             project: test
@@ -35,7 +35,7 @@ spec:
             autoSync: "true"
           - env: prod
             project: prod
-            targetRevision: prod
+            targetRevision: main
             autoSync: "false" # ApplicationSet still can't easily express "no automated block at all"
                                # per-element without goTemplate + sprig conditionals — this is
                                # exactly the kind of awkwardness that makes explicit App-of-Apps
