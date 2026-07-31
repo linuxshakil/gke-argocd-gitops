@@ -36,7 +36,11 @@ jobs:
       - name: Build image
         id: build
         run: |
-          IMAGE_TAG="dev-${GITHUB_SHA::7}"
+          # This tag is the image's PERMANENT identity — it is never "the dev
+          # tag," it's just named after the commit that produced it. The
+          # exact same tag/digest will later be promoted into test and prod
+          # by promote.yml — re-tagged, never rebuilt.
+          IMAGE_TAG="sha-${GITHUB_SHA::7}"
           IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${IMAGE_TAG}"
           docker build -t "$IMAGE" ./app-src
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
