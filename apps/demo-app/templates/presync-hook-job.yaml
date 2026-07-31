@@ -30,4 +30,17 @@ spec:
               echo "Running pre-sync checks for {{ .Values.environment }}..."
               echo "(placeholder for a real DB migration / config validation step)"
               exit 0
+          # REQUIRED here, not optional: bootstrap/namespaces.tf's ResourceQuota
+          # sets a hard limits.cpu/limits.memory ceiling on every namespace.
+          # Once a quota specifies `limits.*`, Kubernetes requires EVERY pod
+          # in that namespace to explicitly declare requests AND limits —
+          # without this block, the Job is rejected outright with
+          # "forbidden: failed quota... must specify limits.cpu for...".
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
 {{- end }}
