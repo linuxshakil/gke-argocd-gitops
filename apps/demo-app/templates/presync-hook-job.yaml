@@ -1,10 +1,19 @@
+{{- if .Values.preSyncCheck.enabled }}
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: {{ include "demo-app.fullname" . }}-presync-check
   annotations:
+    # This is what makes it a hook instead of a normal resource. Argo CD
+    # creates this Job BEFORE syncing anything else in this Application.
     argocd.argoproj.io/hook: PreSync
+    # Delete the old Job before creating a new one on every sync, otherwise
+    # Kubernetes rejects re-creating a Job with the same name.
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # Sync waves control ORDER among resources in the same sync phase — lower
+    # numbers run first. This isn't required for a single PreSync hook, but
+    # is shown here because "explain sync waves vs hooks" is a very common
+    # interview question, and this repo should demonstrate both.
     argocd.argoproj.io/sync-wave: "-1"
 spec:
   backoffLimit: 1
@@ -14,36 +23,24 @@ spec:
       containers:
         - name: presync-check
           image: busybox:1.36
-          imagePullPolicy: IfNotPresent
-
-          resources:
-            requests:
-              cpu: {{ .Values.resources.requests.cpu | quote }}
-              memory: {{ .Values.resources.requests.memory | quote }}
-            limits:
-              cpu: {{ .Values.resources.limits.cpu | quote }}
-              memory: {{ .Values.resources.limits.memory | quote }}
-
           command:
             - sh
             - -c
             - |
-              echo "========================================="
-              echo "Running PreSync checks..."
-              echo "Environment : {{ .Values.environment }}"
-              echo "Release     : {{ .Release.Name }}"
-              echo "Namespace   : {{ .Release.Namespace }}"
-              echo "========================================="
-
-              echo "Checking configuration..."
-              sleep 2
-
-              echo "Checking database connectivity..."
-              sleep 2
-
-              echo "Checking secrets..."
-              sleep 2
-
-              echo "All pre-sync checks passed."
-
+              echo "Running pre-sync checks for {{ .Values.environment }}..."
+              echo "(placeholder for a real DB migration / config validation step)"
               exit 0
+          # REQUIRED here, not optional: bootstrap/namespaces.tf's ResourceQuota
+          # sets a hard limits.cpu/limits.memory ceiling on every namespace.
+          # Once a quota specifies `limits.*`, Kubernetes requires EVERY pod
+          # in that namespace to explicitly declare requests AND limits —
+          # without this block, the Job is rejected outright with
+          # "forbidden: failed quota... must specify limits.cpu for...".
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+{{- end }}
