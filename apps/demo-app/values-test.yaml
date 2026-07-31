@@ -4,7 +4,7 @@ preSyncCheck:
   enabled: true
 
 image:
-  tag: "dev-a1b2c3d"
+  tag: "REPLACE_ME_VIA_PROMOTE_WORKFLOW" # never edit this by hand — run promote.yml instead
 
 replicaCount: 2
 
