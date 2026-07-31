@@ -227,20 +227,43 @@ Recommended GitHub branch protection:
 - `test`: require a PR (no direct pushes) — at least one reviewer
 - `main`: require a PR + at least one reviewer + required CI status checks passing — this is production
 
+### Image Tagging Strategy — Build Once, Promote Everywhere
+
+This is a core GitOps principle this repo previously didn't fully enforce: **an image is built exactly once**, then the *same artifact* moves through dev → test → prod. Nothing is ever rebuilt for a "promotion" — only re-tagged and referenced.
+
+- `ci.yml` (triggered by `develop`) tags every build as `sha-<7-char-git-sha>` — an immutable identity, not "the dev tag." It writes this straight into `values-dev.yaml`.
+- `promote.yml` (manual, `workflow_dispatch`) takes an **already-built, already-Trivy-scanned** `sha-xxxxx` tag and:
+  1. Verifies it actually exists in Artifact Registry (fails loudly if you typo it — this is exactly the mistake that broke `test` earlier: a placeholder tag that was never real)
+  2. Resolves its immutable **digest**
+  3. For `prod` only, optionally creates a human-readable alias tag (e.g. `v1.2.0`) pointing at that *same* digest — a retag, never a rebuild
+  4. Bumps `values-test.yaml` or `values-prod.yaml` with the new tag (and, for prod, the resolved **digest** too)
+  5. Opens a **Pull Request** into `test`/`main` — it never pushes directly, since those branches are protected and still need human review
+
+`values-prod.yaml` sets both `image.tag` (cosmetic, human-readable) and `image.digest` (the actual immutable pin the Helm chart renders — see `deployment.yaml`/`rollout.yaml`'s `{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}`). A tag can technically be silently repointed at a different image later; a digest physically cannot — prod gets the strictest guarantee available.
+
 ### The Flow
 
 ```
 1. Push to `develop` (app-src/** changed)
-     → CI builds the image, Trivy-scans it, pushes it, bumps values-dev.yaml
+     → CI builds sha-<gitsha> ONCE, Trivy-scans it, pushes it, bumps values-dev.yaml
      → Argo CD auto-syncs demo-app-dev (PreSync hook is disabled in dev, so it's instant)
 
-2. Verify in dev → open PR: develop → test
-     → merge → Argo CD auto-syncs demo-app-test
+2. Verify in dev → run the "Promote Image" workflow manually:
+     target_env: test
+     image_tag: sha-<the tag currently in values-dev.yaml — copy it, don't retype from memory>
+     → it verifies the tag exists, bumps values-test.yaml, opens a PR: promote/test-sha-xxxxx → test
+     → review + merge that PR (no rebuild happened — same image, just a new reference)
+     → Argo CD auto-syncs demo-app-test
      → the PreSync Job hook runs FIRST (sync-wave -1), THEN the Deployment updates
 
-3. QA signs off in test → open PR: test → main
-     → bump values-prod.yaml to an explicit, immutable tag (e.g. v1.2.0 — never "latest")
-     → merge (requires review + passing checks) → demo-app-prod shows OutOfSync, but does NOT auto-apply
+3. QA signs off in test → run "Promote Image" again:
+     target_env: prod
+     image_tag: sha-<the SAME tag from values-test.yaml — the exact image QA verified>
+     release_version: v1.2.0
+     → it creates the v1.2.0 alias tag (same digest), resolves the digest,
+       bumps values-prod.yaml with BOTH, opens a PR: promote/prod-v1.2.0 → main
+     → review + merge (requires review + passing checks) → demo-app-prod shows
+       OutOfSync, but does NOT auto-apply
 
 4. A release manager reviews the diff:
      argocd app diff demo-app-prod
@@ -319,6 +342,9 @@ kubectl get secret argocd-notifications-secret -n argocd
 | 16 | Several Argo CD pods stuck `Init:0/1` for many minutes, `argocd-server` shows `CreateContainerError`, liveness/readiness probes fail with `connection refused` | **Node resource starvation**, not a config bug — `kubectl describe nodes \| grep -A5 "Allocated resources"` shows CPU/memory requests already at ~90%+ before Argo CD even schedules. On a small/shared node pool (this cluster also runs WordPress), the default Argo CD chart's resource requests for ~7 components simply don't fit | Fixed in `argocd.tf`: `dex.enabled = false` (SSO isn't wired up yet — no reason to run an idle component), plus explicit, conservative `resources.requests/limits` set on every remaining component (`server`, `controller`, `repoServer`, `redis`, `notifications`, `applicationSet`) and on `argo-rollouts`. If pods are still stuck after re-applying, the node pool itself needs more capacity — resize it in the `gke-infra-terraform` repo (bigger machine type or more nodes), this repo can't fix a genuinely undersized cluster from the outside |
 | 17 | `demo-app-dev`/`test`/`prod` stuck `OutOfSync`/`Missing`, retrying automated sync repeatedly; `kubectl describe application` shows `resource :ServiceAccount is not permitted in project dev` (or similar for other kinds) | The corresponding `AppProject`'s `namespaceResourceWhitelist` doesn't list every Kubernetes kind the Helm chart actually creates — Argo CD silently blocks any kind not explicitly whitelisted, even if the chart is otherwise valid | Fixed — all three `argocd-projects/*.yaml` now whitelist `ServiceAccount` (created by `serviceaccount.yaml`) and `networking.gke.io/ManagedCertificate` (created by `ingress.yaml` when `ingress.enabled: true`), alongside the kinds already listed. General lesson: whenever a new template/resource kind is added to the Helm chart, the relevant AppProject's whitelist must be updated too, or Argo CD will block it with exactly this message |
 | 18 | Pod stuck `ImagePullBackOff`, event shows `failed to fetch oauth token... 404 Not Found` when pulling `.../demo-app/demo-app:dev-latest` | The Artifact Registry **repository itself** (`demo-app`) never existed — the infra repo's `artifact-registry` module only created `backup-images` (for the WordPress backup job), nothing for this project's demo app | Fixed — `bootstrap/artifact-registry.tf` in this repo now creates its own dedicated `demo-app` Docker repository (with a cleanup policy keeping the last 10 versions). Run `terraform apply` in `bootstrap/`, THEN push to `app-src/**` to trigger CI and actually populate an image at that tag |
+| 19 | Presync hook `Job` pod rejected: `forbidden: failed quota: test-quota: must specify limits.cpu...` (repeating hundreds of times over hours) | Once a namespace's `ResourceQuota` specifies `limits.*`, **every** pod in that namespace must explicitly declare `requests`/`limits` — the hook Job's `busybox` container didn't | Fixed — `presync-hook-job.yaml` now sets explicit `resources.requests/limits`. If you add any NEW pod-creating template later, it needs this too, or the same quota rejection happens again |
+| 20 | `demo-app-test` stuck `OutOfSync`/`Missing`, `kubectl describe application` shows `Operation State: ... waiting for completion of hook batch/Job/...` referencing a Job that no longer exists (`kubectl get jobs` shows nothing) | Argo CD's operation state got "stuck" pointing at a stale sync operation, usually after a hook resource was manually deleted mid-operation | `kubectl patch application <name> -n argocd --type json -p '[{"op": "remove", "path": "/operation"}]'` to force-clear the stuck operation, then `kubectl patch application <name> -n argocd --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'` to trigger a clean re-evaluation — both work via plain `kubectl`, no `argocd` CLI/port-forward needed |
+| 21 | Promoted a tag manually by typing it from memory (e.g. `dev-a1b2c3d`), and it never existed — `ImagePullBackOff` with `not found` | Manual `sed`-based promotion is error-prone; a fictional/example tag from documentation got typed in instead of the real one | Fixed — `promote.yml` now verifies the source tag actually exists in Artifact Registry via `gcloud artifacts docker images describe` and fails loudly BEFORE opening any PR, instead of silently shipping a typo three steps later |
 
 ---
 
@@ -384,6 +410,12 @@ kubectl get secret argocd-notifications-secret -n argocd
 
 17. **Why does this repo create its own Workload Identity Pool instead of reusing the infra repo's?**
     Two reasons: (1) the infra repo's WIF *provider* has an `attribute_condition` that only trusts tokens from that specific repository — a token from this repo would be rejected before any IAM policy is even evaluated, so reusing it isn't even possible without editing the other repo's Terraform. (2) Least privilege — this repo's CI only ever needs to push a Docker image, so its dedicated service account only holds `roles/artifactregistry.writer`, nothing close to the infra repo's CI identity's broader permissions.
+
+18. **What does "build once, promote everywhere" mean, and why does rebuilding per environment violate it?**
+    It means the exact binary artifact that gets tested is the exact same artifact that reaches production — only its *reference* (which tag/digest an environment's values file points at) changes between environments. Rebuilding per environment (even from identical source) can produce a different result — a different base-image patch version pulled at build time, a different dependency resolved, a subtly different layer — so what got tested is no longer provably what ships. This repo's `promote.yml` only ever re-tags an already-built image; it never runs `docker build` again.
+
+19. **Why does `values-prod.yaml` pin by digest instead of just a version tag like `v1.2.0`?**
+    A tag is a mutable pointer — someone (or some automation) could push a new image and reuse the same tag name, silently changing what `v1.2.0` refers to. A digest (`sha256:...`) is a cryptographic hash of the image's actual content — it's physically impossible for two different images to share one digest. Prod pins the digest for a real, unfalsifiable guarantee of exactly what's running; the tag stays only as a human-readable label alongside it.
 
 ---
 

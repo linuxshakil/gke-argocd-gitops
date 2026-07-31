@@ -9,6 +9,9 @@ rollout:
 image:
   repository: asia-south1-docker.pkg.dev/gke-prod-demo-001/demo-app/demo-app
   tag: "latest"
+  digest: "" # e.g. "sha256:abc123..." — when set, this is used INSTEAD of tag.
+             # A tag can be silently repointed at a different image later;
+             # a digest physically cannot. prod sets this, dev/test don't need to.
   pullPolicy: IfNotPresent
 
 replicaCount: 1

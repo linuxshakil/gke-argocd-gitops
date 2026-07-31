@@ -1,0 +1,122 @@
+name: Promote Image (Retag, Never Rebuild)
+
+# Manual, deliberate action — a human picks the exact already-verified image
+# and the exact target environment. This workflow NEVER runs `docker build`;
+# it only re-tags an existing image in Artifact Registry and opens a Pull
+# Request bumping the target environment's values file. The actual merge
+# (and therefore the actual deploy) still requires human review — this
+# workflow does the tedious, error-prone part (copying the right tag/digest)
+# so nobody promotes a typo'd or non-existent tag by hand again.
+on:
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Environment to promote INTO"
+        required: true
+        type: choice
+        options: [test, prod]
+      image_tag:
+        description: "The EXACT immutable tag to promote (e.g. sha-be04632). Copy this from apps/demo-app/values-dev.yaml (promoting to test) or values-test.yaml (promoting to prod) — never type it from memory."
+        required: true
+        type: string
+      release_version:
+        description: "Only for target_env=prod: a human-readable version alias (e.g. v1.2.0). Leave blank for test."
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+env:
+  PROJECT_ID: gke-prod-demo-001
+  REGION: asia-south1
+  REPO: demo-app
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Guard rail: fail immediately and clearly if someone fat-fingers a tag
+      # that was never actually built — instead of finding out via a
+      # confusing ImagePullBackOff on the cluster ten minutes later.
+      - name: Verify the source tag actually exists
+        id: verify
+        run: |
+          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
+          echo "Checking $SOURCE ..."
+          DIGEST=$(gcloud artifacts docker images describe "$SOURCE" --format='value(image_summary.digest)')
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Tag '${{ inputs.image_tag }}' was not found in Artifact Registry. Nothing was promoted."
+            exit 1
+          fi
+          echo "Found digest: $DIGEST"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # Only creates a human-readable ALIAS pointing at the exact same
+      # digest — this is a retag, not a rebuild. Test doesn't get an alias;
+      # it just reuses the sha-<commit> tag directly, since nobody outside
+      # engineering ever needs a friendly name for a test deployment.
+      - name: Create release alias tag (prod only)
+        if: inputs.target_env == 'prod' && inputs.release_version != ''
+        run: |
+          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
+          ALIAS="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.release_version }}"
+          gcloud artifacts docker tags add "$SOURCE" "$ALIAS"
+
+      - name: Determine final tag
+        id: final
+        run: |
+          if [ "${{ inputs.target_env }}" = "prod" ] && [ -n "${{ inputs.release_version }}" ]; then
+            echo "tag=${{ inputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create promotion branch off the target environment branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin ${{ inputs.target_env }}
+          git checkout -b promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }} origin/${{ inputs.target_env }}
+
+      # prod gets BOTH tag (readable) and digest (the actual immutable pin —
+      # see values.yaml/deployment.yaml: digest wins over tag when set).
+      # test only needs the tag; digest-pinning there is unnecessary rigor.
+      - name: Bump the target values file (no rebuild — just a reference update)
+        run: |
+          VALUES_FILE="apps/demo-app/values-${{ inputs.target_env }}.yaml"
+          sed -i "s/tag: .*/tag: \"${{ steps.final.outputs.tag }}\"/" "$VALUES_FILE"
+          if [ "${{ inputs.target_env }}" = "prod" ]; then
+            sed -i "s#digest: .*#digest: \"${{ steps.verify.outputs.digest }}\"#" "$VALUES_FILE"
+          fi
+          git add "$VALUES_FILE"
+          git commit -m "promote: ${{ inputs.target_env }} -> ${{ steps.final.outputs.tag }} (source: ${{ inputs.image_tag }})"
+          git push origin promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }}
+
+      # Opens a PR instead of pushing straight to test/main — those branches
+      # are protected (see README's branch protection recommendations) and
+      # still require a human reviewer to actually approve the promotion.
+      - name: Open the promotion Pull Request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --base ${{ inputs.target_env }} \
+            --head promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }} \
+            --title "Promote to ${{ inputs.target_env }}: ${{ steps.final.outputs.tag }}" \
+            --body "Promotes the already-built, already-scanned image \`${{ inputs.image_tag }}\` (digest \`${{ steps.verify.outputs.digest }}\`) into **${{ inputs.target_env }}**. No rebuild occurred — this is a retag/reference update only. Review the diff, then merge to deploy."
