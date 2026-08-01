@@ -93,16 +93,7 @@ jobs:
           else
             echo "tag=${{ steps.verify.outputs.clean_tag }}" >> "$GITHUB_OUTPUT"
           fi
-      
 
-      - name: Determine target branch
-        id: target
-        run: |
-          if [ "${{ inputs.target_env }}" = "prod" ]; then
-            echo "branch=main" >> "$GITHUB_OUTPUT"
-          else
-            echo "branch=${{ inputs.target_env }}" >> "$GITHUB_OUTPUT"
-          fi
       # Idempotency guard: if the target environment is ALREADY pointed at
       # this exact tag (and, for prod, this exact digest), there's nothing
       # to do — no pointless PR, no empty commit, no wasted registry retag.
