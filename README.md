@@ -241,6 +241,18 @@ This is a core GitOps principle this repo previously didn't fully enforce: **an 
 
 `values-prod.yaml` sets both `image.tag` (cosmetic, human-readable) and `image.digest` (the actual immutable pin the Helm chart renders — see `deployment.yaml`/`rollout.yaml`'s `{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}`). A tag can technically be silently repointed at a different image later; a digest physically cannot — prod gets the strictest guarantee available.
 
+### `promote.yml` Safety Guarantees
+
+Running the same promotion twice, or two promotions racing each other, should never corrupt anything. `promote.yml` is built specifically to guarantee:
+
+| Guarantee | How |
+|---|---|
+| No `non-fast-forward` push errors | Every run creates a branch named `promote/<env>-<tag>-<run_id>` — unique per workflow run, never collides with a leftover branch from an earlier attempt |
+| No duplicate PRs | Before creating a PR, it checks `gh pr list --head <branch>` first — a retry of the same run reuses the existing PR instead of erroring |
+| Skips if already promoted | Reads the target values file's current `tag` (and `digest`, for prod) BEFORE touching anything — if they already match what's being promoted, it exits cleanly with no PR, no commit, no registry call |
+| No empty commits | `git diff --quiet` gate right before committing — a no-op `sed` (already-correct value) never produces a commit |
+| One promotion per environment at a time | `concurrency: group: promote-<target_env>` — a second run targeting the SAME environment queues behind the first instead of racing it; `test` and `prod` promotions can still run in parallel since they're different groups |
+
 ### The Flow
 
 ```
