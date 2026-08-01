@@ -34,7 +34,7 @@ autoscaling:
 
 ingress:
   enabled: true
-  host: "yourdomain.com"
+  host: "prod.myahad.online"
   className: "gce"
 
 podAnnotations:
