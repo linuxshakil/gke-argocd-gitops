@@ -65,19 +65,25 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       # Guard rail: fail immediately and clearly if someone fat-fingers a tag
-      # that was never actually built.
+      # that was never actually built. Also defensively strips a leading
+      # ":" in case someone pastes the tag straight out of a full image
+      # reference like "...demo-app:sha-971fce0" (copying from that colon
+      # onward is an easy mistake) instead of just the "sha-971fce0" part.
       - name: Verify the source tag actually exists, resolve digest
         id: verify
         run: |
-          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
+          CLEAN_TAG="${{ inputs.image_tag }}"
+          CLEAN_TAG="${CLEAN_TAG#:}"
+          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${CLEAN_TAG}"
           echo "Checking $SOURCE ..."
           DIGEST=$(gcloud artifacts docker images describe "$SOURCE" --format='value(image_summary.digest)' 2>/dev/null || true)
           if [ -z "$DIGEST" ]; then
-            echo "::error::Tag '${{ inputs.image_tag }}' was not found in Artifact Registry. Nothing was promoted."
+            echo "::error::Image '$SOURCE' was not found in Artifact Registry. Nothing was promoted. (Tip: paste only the tag itself, e.g. 'sha-971fce0' — not the leading colon or the full repo path.)"
             exit 1
           fi
           echo "Found digest: $DIGEST"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "clean_tag=${CLEAN_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Determine final tag
         id: final
@@ -85,7 +91,7 @@ jobs:
           if [ "${{ inputs.target_env }}" = "prod" ] && [ -n "${{ inputs.release_version }}" ]; then
             echo "tag=${{ inputs.release_version }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ steps.verify.outputs.clean_tag }}" >> "$GITHUB_OUTPUT"
           fi
 
       # Idempotency guard: if the target environment is ALREADY pointed at
@@ -115,7 +121,7 @@ jobs:
       - name: Create release alias tag (prod only)
         if: steps.check.outputs.skip == 'false' && inputs.target_env == 'prod' && inputs.release_version != ''
         run: |
-          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
+          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ steps.verify.outputs.clean_tag }}"
           ALIAS="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.release_version }}"
           gcloud artifacts docker tags add "$SOURCE" "$ALIAS"
 
@@ -157,7 +163,7 @@ jobs:
           VALUES_FILE="apps/demo-app/values-${{ inputs.target_env }}.yaml"
           git checkout -b "$BRANCH"
           git add "$VALUES_FILE"
-          git commit -m "promote: ${{ inputs.target_env }} -> ${{ steps.final.outputs.tag }} (source: ${{ inputs.image_tag }})"
+          git commit -m "promote: ${{ inputs.target_env }} -> ${{ steps.final.outputs.tag }} (source: ${{ steps.verify.outputs.clean_tag }})"
           git push --force origin "$BRANCH"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
@@ -178,5 +184,5 @@ jobs:
               --base ${{ inputs.target_env }} \
               --head "$BRANCH" \
               --title "Promote to ${{ inputs.target_env }}: ${{ steps.final.outputs.tag }}" \
-              --body "Promotes the already-built, already-scanned image \`${{ inputs.image_tag }}\` (digest \`${{ steps.verify.outputs.digest }}\`) into **${{ inputs.target_env }}**. No rebuild occurred — this is a retag/reference update only. Review the diff, then merge to deploy."
+              --body "Promotes the already-built, already-scanned image \`${{ steps.verify.outputs.clean_tag }}\` (digest \`${{ steps.verify.outputs.digest }}\`) into **${{ inputs.target_env }}**. No rebuild occurred — this is a retag/reference update only. Review the diff, then merge to deploy."
           fi
