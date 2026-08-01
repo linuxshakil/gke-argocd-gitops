@@ -4,9 +4,7 @@ name: Promote Image (Retag, Never Rebuild)
 # and the exact target environment. This workflow NEVER runs `docker build`;
 # it only re-tags an existing image in Artifact Registry and opens a Pull
 # Request bumping the target environment's values file. The actual merge
-# (and therefore the actual deploy) still requires human review — this
-# workflow does the tedious, error-prone part (copying the right tag/digest)
-# so nobody promotes a typo'd or non-existent tag by hand again.
+# (and therefore the actual deploy) still requires human review.
 on:
   workflow_dispatch:
     inputs:
@@ -29,6 +27,16 @@ permissions:
   contents: write
   pull-requests: write
 
+# Only ONE promotion into a given environment can run at a time. A second
+# run targeting the SAME environment queues behind the first instead of
+# racing it (cancel-in-progress: false — we never want to abort a promotion
+# that's already mutating the registry/branch state midway through).
+# A promotion to `test` and a promotion to `prod` can still run in parallel
+# — they're different concurrency groups.
+concurrency:
+  group: promote-${{ inputs.target_env }}
+  cancel-in-progress: false
+
 env:
   PROJECT_ID: gke-prod-demo-001
   REGION: asia-south1
@@ -38,9 +46,14 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     steps:
+      # Check out the target branch directly, at whatever its TRUE current
+      # tip is at the moment this job actually starts running (not whenever
+      # it was queued) — this is what makes the later branch-off always
+      # fast-forward-safe, even after waiting behind another promotion.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.target_env }}
 
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@v2
@@ -52,31 +65,19 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       # Guard rail: fail immediately and clearly if someone fat-fingers a tag
-      # that was never actually built — instead of finding out via a
-      # confusing ImagePullBackOff on the cluster ten minutes later.
-      - name: Verify the source tag actually exists
+      # that was never actually built.
+      - name: Verify the source tag actually exists, resolve digest
         id: verify
         run: |
           SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
           echo "Checking $SOURCE ..."
-          DIGEST=$(gcloud artifacts docker images describe "$SOURCE" --format='value(image_summary.digest)')
+          DIGEST=$(gcloud artifacts docker images describe "$SOURCE" --format='value(image_summary.digest)' 2>/dev/null || true)
           if [ -z "$DIGEST" ]; then
             echo "::error::Tag '${{ inputs.image_tag }}' was not found in Artifact Registry. Nothing was promoted."
             exit 1
           fi
           echo "Found digest: $DIGEST"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-
-      # Only creates a human-readable ALIAS pointing at the exact same
-      # digest — this is a retag, not a rebuild. Test doesn't get an alias;
-      # it just reuses the sha-<commit> tag directly, since nobody outside
-      # engineering ever needs a friendly name for a test deployment.
-      - name: Create release alias tag (prod only)
-        if: inputs.target_env == 'prod' && inputs.release_version != ''
-        run: |
-          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
-          ALIAS="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.release_version }}"
-          gcloud artifacts docker tags add "$SOURCE" "$ALIAS"
 
       - name: Determine final tag
         id: final
@@ -87,36 +88,95 @@ jobs:
             echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create promotion branch off the target environment branch
+      # Idempotency guard: if the target environment is ALREADY pointed at
+      # this exact tag (and, for prod, this exact digest), there's nothing
+      # to do — no pointless PR, no empty commit, no wasted registry retag.
+      - name: Check whether target already matches this exact image
+        id: check
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin ${{ inputs.target_env }}
-          git checkout -b promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }} origin/${{ inputs.target_env }}
+          VALUES_FILE="apps/demo-app/values-${{ inputs.target_env }}.yaml"
+          CURRENT_TAG=$(grep -oP '(?<=tag: ")[^"]*' "$VALUES_FILE" | head -1)
+          SKIP="false"
+          if [ "$CURRENT_TAG" = "${{ steps.final.outputs.tag }}" ]; then
+            if [ "${{ inputs.target_env }}" = "prod" ]; then
+              CURRENT_DIGEST=$(grep -oP '(?<=digest: ")[^"]*' "$VALUES_FILE" | head -1)
+              [ "$CURRENT_DIGEST" = "${{ steps.verify.outputs.digest }}" ] && SKIP="true"
+            else
+              SKIP="true"
+            fi
+          fi
+          if [ "$SKIP" = "true" ]; then
+            echo "::notice::${{ inputs.target_env }} already points at ${{ steps.final.outputs.tag }} — nothing to promote."
+          fi
+          echo "skip=${SKIP}" >> "$GITHUB_OUTPUT"
 
-      # prod gets BOTH tag (readable) and digest (the actual immutable pin —
-      # see values.yaml/deployment.yaml: digest wins over tag when set).
-      # test only needs the tag; digest-pinning there is unnecessary rigor.
+      # Only creates a human-readable ALIAS pointing at the exact same
+      # digest — a retag, not a rebuild.
+      - name: Create release alias tag (prod only)
+        if: steps.check.outputs.skip == 'false' && inputs.target_env == 'prod' && inputs.release_version != ''
+        run: |
+          SOURCE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.image_tag }}"
+          ALIAS="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.REPO }}:${{ inputs.release_version }}"
+          gcloud artifacts docker tags add "$SOURCE" "$ALIAS"
+
       - name: Bump the target values file (no rebuild — just a reference update)
+        if: steps.check.outputs.skip == 'false'
         run: |
           VALUES_FILE="apps/demo-app/values-${{ inputs.target_env }}.yaml"
           sed -i "s/tag: .*/tag: \"${{ steps.final.outputs.tag }}\"/" "$VALUES_FILE"
           if [ "${{ inputs.target_env }}" = "prod" ]; then
             sed -i "s#digest: .*#digest: \"${{ steps.verify.outputs.digest }}\"#" "$VALUES_FILE"
           fi
+
+      # Belt-and-suspenders on top of the skip check above: never commit if
+      # the file genuinely didn't change.
+      - name: Check for an actual diff
+        id: diff
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          VALUES_FILE="apps/demo-app/values-${{ inputs.target_env }}.yaml"
+          if git diff --quiet -- "$VALUES_FILE"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Branch name includes the run ID, so it is UNIQUE to this specific
+      # workflow run — no collision with a branch left over from an earlier
+      # (possibly failed) run, which is exactly what caused the
+      # non-fast-forward error. `--force` is safe here specifically because
+      # this branch name can only ever be reused by a RETRY of this SAME
+      # run (same run_id) — nobody else will ever push to it.
+      - name: Create branch, commit, and push
+        id: push
+        if: steps.check.outputs.skip == 'false' && steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }}-${{ github.run_id }}"
+          VALUES_FILE="apps/demo-app/values-${{ inputs.target_env }}.yaml"
+          git checkout -b "$BRANCH"
           git add "$VALUES_FILE"
           git commit -m "promote: ${{ inputs.target_env }} -> ${{ steps.final.outputs.tag }} (source: ${{ inputs.image_tag }})"
-          git push origin promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }}
+          git push --force origin "$BRANCH"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
-      # Opens a PR instead of pushing straight to test/main — those branches
-      # are protected (see README's branch protection recommendations) and
-      # still require a human reviewer to actually approve the promotion.
-      - name: Open the promotion Pull Request
+      # Idempotent: if a PR for this exact branch already exists (e.g. this
+      # step is being re-run after a later step failed previously), reuse
+      # it instead of erroring out on a duplicate-PR GraphQL error.
+      - name: Open (or reuse) the promotion Pull Request
+        if: steps.check.outputs.skip == 'false' && steps.diff.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr create \
-            --base ${{ inputs.target_env }} \
-            --head promote/${{ inputs.target_env }}-${{ steps.final.outputs.tag }} \
-            --title "Promote to ${{ inputs.target_env }}: ${{ steps.final.outputs.tag }}" \
-            --body "Promotes the already-built, already-scanned image \`${{ inputs.image_tag }}\` (digest \`${{ steps.verify.outputs.digest }}\`) into **${{ inputs.target_env }}**. No rebuild occurred — this is a retag/reference update only. Review the diff, then merge to deploy."
+          BRANCH="${{ steps.push.outputs.branch }}"
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already exists for $BRANCH — reusing it, not creating a duplicate."
+          else
+            gh pr create \
+              --base ${{ inputs.target_env }} \
+              --head "$BRANCH" \
+              --title "Promote to ${{ inputs.target_env }}: ${{ steps.final.outputs.tag }}" \
+              --body "Promotes the already-built, already-scanned image \`${{ inputs.image_tag }}\` (digest \`${{ steps.verify.outputs.digest }}\`) into **${{ inputs.target_env }}**. No rebuild occurred — this is a retag/reference update only. Review the diff, then merge to deploy."
+          fi
