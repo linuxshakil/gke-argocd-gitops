@@ -10,7 +10,7 @@ APP_VERSION = os.environ.get("APP_VERSION", "dev")
 @app.route("/")
 def index():
     return jsonify(
-        message="Hello from Shakil's demo-app!",
+        message="Hello from Shakil's demo-app final!",
         environment=ENVIRONMENT,
         version=APP_VERSION,
     )

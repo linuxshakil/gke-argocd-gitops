@@ -291,6 +291,89 @@ Running the same promotion twice, or two promotions racing each other, should ne
    rolls back immediately to the last known-good version — no new Git commit needed.
 ```
 
+### Test Deployment — Full Walkthrough (Step by Step)
+
+This is the same flow as above, zoomed in on `test` specifically, with the actual commands and what to check at every stage — written so a first-time reader can follow along without guessing.
+
+**Step 1 — Get a verified image into `dev` first**
+
+```bash
+git checkout develop
+# ... edit app-src/ ...
+git add app-src/
+git commit -m "some change"
+git push origin develop
+```
+
+This triggers `ci.yml`. Watch it in **GitHub → Actions → CI - Build, Scan & Deploy to Dev**. When it finishes, it has:
+- built exactly one image, tagged `sha-<7-char-commit-sha>`
+- Trivy-scanned it (fails the whole run if a fixable HIGH/CRITICAL CVE is found)
+- pushed it to Artifact Registry
+- bumped `apps/demo-app/values-dev.yaml`'s `image.tag` and pushed that commit back to `develop`
+
+```bash
+# Confirm the new tag actually landed
+git pull origin develop
+cat apps/demo-app/values-dev.yaml | grep tag
+```
+
+Argo CD's `demo-app-dev` Application auto-syncs (tracks `develop`, `automated: {prune: true, selfHeal: true}`) — within ~3 minutes (Argo CD's default Git polling interval) it deploys automatically. Confirm:
+
+```bash
+kubectl get application demo-app-dev -n argocd
+kubectl get pods -n dev
+```
+
+**Step 2 — Promote that exact image into `test` (no rebuild)**
+
+Copy the tag from Step 1, then in **GitHub → Actions → "Promote Image (Retag, Never Rebuild)" → Run workflow**:
+
+| Field | Value |
+|---|---|
+| target_env | `test` |
+| image_tag | the `sha-xxxxx` value from `values-dev.yaml` |
+| release_version | leave blank |
+
+Watch the run. It will:
+1. Verify that tag genuinely exists in Artifact Registry (fails loudly if you mistype it)
+2. Check whether `test` already points at this tag (skips cleanly if so — nothing to do)
+3. Bump `apps/demo-app/values-test.yaml`'s `image.tag`
+4. Push a uniquely-named branch and open a Pull Request into `test`
+
+**Step 3 — Review and merge the promotion PR**
+
+Go to **GitHub → Pull requests**. You'll see one titled `Promote to test: sha-xxxxx`. The diff should be exactly one line — the image tag in `values-test.yaml`. Merge it.
+
+**Step 4 — Argo CD picks up the merge and syncs `test`**
+
+`demo-app-test`'s Application tracks the `test` branch with `automated` sync — no manual `argocd app sync` needed. Within ~3 minutes:
+
+```bash
+kubectl get application demo-app-test -n argocd
+```
+
+You'll see the sync go through **two phases**, because `values-test.yaml` has `preSyncCheck.enabled: true`:
+
+```bash
+# Phase 1 — the PreSync hook Job runs FIRST (sync-wave: -1) and must
+# succeed before Argo CD touches anything else
+kubectl get jobs -n test
+kubectl logs -n test job/demo-app-test-presync-check
+
+# Phase 2 — only after that Job succeeds does the Deployment/Service/HPA
+# actually update to the new image
+kubectl get pods -n test -w
+```
+
+**Step 5 — Confirm it's actually running the promoted image**
+
+```bash
+kubectl get pods -n test -o jsonpath='{.items[0].spec.containers[0].image}'
+# should exactly match the sha-xxxxx tag you promoted in Step 2
+```
+
+If `demo-app-test` shows `Synced` + `Healthy` and the pod's image matches, the promotion worked end-to-end — same artifact that was in `dev`, now running in `test`, with zero rebuilds anywhere in the chain.
+
 ### A Note on `root-app.yaml`
 
 Unlike `demo-app-dev`/`test`/`prod` (whose `source.targetRevision` follows the branch table above), `argocd-apps/root-app.yaml` itself always tracks `main` — because it defines the Argo CD **platform configuration** (which environments exist, their sync policies, RBAC boundaries). Changes to that shape deserve the same review rigor as a production release, regardless of which branch an individual app deployment is promoted through.
