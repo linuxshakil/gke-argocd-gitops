@@ -39,12 +39,8 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   }
 
   # The critical safety line: reject any token whose `repository` claim
-  # isn't one of these EXACT repos. Add a new repo here (one line) instead
-  # of spinning up a whole new pool per repo — the pool is shared,
-  # reusable infrastructure; per-repo LEAST PRIVILEGE still comes from each
-  # repo getting its own dedicated service account + its own narrow
-  # `google_service_account_iam_member` binding below, not from this list.
-  attribute_condition = "assertion.repository in [\"linuxshakil/gke-argocd-gitops\", \"linuxshakil/demo-app\"]"
+  # isn't EXACTLY this repo. Update this if you ever fork/rename the repo.
+  attribute_condition = "assertion.repository == \"linuxshakil/gke-argocd-gitops\""
 }
 
 # A dedicated, minimal-privilege service account — NOT the infra repo's
@@ -68,44 +64,10 @@ resource "google_service_account_iam_member" "gitops_ci_wif_binding" {
 
 output "gitops_ci_service_account_email" {
   value       = google_service_account.gitops_ci.email
-  description = "→ GitHub secret GCP_SERVICE_ACCOUNT (in gke-argocd-gitops repo)"
+  description = "→ GitHub secret GCP_SERVICE_ACCOUNT"
 }
 
 output "gitops_ci_wif_provider" {
   value       = google_iam_workload_identity_pool_provider.github.name
-  description = "→ GitHub secret GCP_WIF_PROVIDER (in gke-argocd-gitops repo)"
-}
-
-#############################################################
-# demo-app repo — its own dedicated SA, same shared pool
-#############################################################
-# Reuses google_iam_workload_identity_pool.gitops_ci above (no new pool),
-# but this SA is completely isolated from gitops_ci's SA: a leaked/misused
-# demo-app repo token can NEVER impersonate gitops-ci-sa, and vice versa —
-# each repo's binding is scoped to `attribute.repository/<that repo only>`.
-resource "google_service_account" "demo_app_ci" {
-  account_id   = "demo-app-ci-sa"
-  display_name = "CI identity for demo-app (image build + push ONLY)"
-}
-
-resource "google_project_iam_member" "demo_app_ci_artifact_writer" {
-  project = var.project_id
-  role    = "roles/artifactregistry.writer"
-  member  = "serviceAccount:${google_service_account.demo_app_ci.email}"
-}
-
-resource "google_service_account_iam_member" "demo_app_ci_wif_binding" {
-  service_account_id = google_service_account.demo_app_ci.name
-  role                = "roles/iam.workloadIdentityUser"
-  member              = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.gitops_ci.name}/attribute.repository/linuxshakil/demo-app"
-}
-
-output "demo_app_ci_service_account_email" {
-  value       = google_service_account.demo_app_ci.email
-  description = "→ GitHub secret GCP_SERVICE_ACCOUNT (in demo-app repo)"
-}
-
-output "demo_app_ci_wif_provider" {
-  value       = google_iam_workload_identity_pool_provider.github.name
-  description = "→ GitHub secret GCP_WIF_PROVIDER (in demo-app repo — SAME value as gitops repo's, only the SA differs)"
+  description = "→ GitHub secret GCP_WIF_PROVIDER"
 }
