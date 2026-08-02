@@ -1,7 +1,7 @@
 environment: dev
 
 image:
-  tag: "sha-971fce0"
+  tag: "sha-049a901"
 
 replicaCount: 1
 
