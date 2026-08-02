@@ -13,7 +13,7 @@ This README explains **everything** we built, in simple words. If you are new to
 5. [Part B: GitHub Actions — The Automation](#5-part-b-github-actions--the-automation)
 6. [Part C: Argo CD — How Deployment Actually Happens](#6-part-c-argo-cd--how-deployment-actually-happens)
 7. [Branching Strategy](#7-branching-strategy)
-8. [Complete Step-by-Step Setup (From Zero)](#8-complete-step-by-step-setup-from-zero)
+8. [Complete Step-by-Step Setup (From Zero)](#8-complete-step-by-step-setup-from-zero--full-hands-on-guide)
 9. [Bonus: What If We Had Separate GCP Accounts for Dev/Test/Prod?](#9-bonus-what-if-we-had-separate-gcp-accounts-for-devtestprod)
 10. [Common Problems and Fixes](#10-common-problems-and-fixes)
 11. [Interview Questions (Quick Reference)](#11-interview-questions-quick-reference)
@@ -259,48 +259,266 @@ The app repo answers the question "what is the current best code?" The deploymen
 
 ---
 
-## 8. Complete Step-by-Step Setup (From Zero)
+## 8. Complete Step-by-Step Setup (From Zero) — Full Hands-On Guide
+
+This section is written for someone doing this for the very first time. Every click, every command, in the exact order we actually did them. Nothing is skipped.
+
+### Prerequisites Checklist
+
+- [ ] A Google Cloud account with billing enabled, and a GKE cluster already running (built by a separate infra project)
+- [ ] A GitHub account
+- [ ] `gcloud`, `kubectl`, `terraform`, `helm` installed locally
+- [ ] `gcloud auth login` and `gcloud auth application-default login` already run once
+
+---
+
+### STEP 1 — Create the two GitHub repositories
+
+1. Go to `github.com/new`
+2. Create repo **`gke-argocd-gitops`** (this holds Terraform + Argo CD + Helm chart)
+3. Create a second repo **`demo-app`** (this holds only the application source code)
+4. Clone both locally
 
 ```bash
-# ===== 1. Bootstrap: install Argo CD, Argo Rollouts, namespaces, WIF =====
+git clone https://github.com/<you>/gke-argocd-gitops.git
+git clone https://github.com/<you>/demo-app.git
+```
+
+Put this project's `gke-argocd-gitops/` files into the first clone, and `demo-app/` files into the second. Push both to their `main` branch.
+
+Then, in `gke-argocd-gitops`, also create the two other long-lived branches:
+
+```bash
+cd gke-argocd-gitops
+git checkout -b develop
+git push -u origin develop
+git checkout -b test
+git push -u origin test
+git checkout main
+```
+
+---
+
+### STEP 2 — Run Terraform (`bootstrap/`)
+
+```bash
 cd gke-argocd-gitops/bootstrap
 terraform init
+terraform plan       # READ this output before continuing
 terraform apply
+```
 
-# Get Argo CD's initial admin password
-terraform output get_admin_password_command   # run the command it prints
+Type `yes` when prompted. This single `apply` creates:
+- Argo CD + Argo Rollouts (installed onto your existing GKE cluster)
+- The `dev`, `test`, `prod` namespaces (with resource limits and network isolation)
+- A Workload Identity Pool (a secure, passwordless bridge between GitHub and Google Cloud)
+- Two separate, isolated service accounts — one for each GitHub repo's CI
+- The `demo-app` Artifact Registry repository (where Docker images will be stored)
 
-# ===== 2. Add GitHub Secrets =====
-# In BOTH repos (demo-app, gke-argocd-gitops), add:
-#   GCP_WIF_PROVIDER       (from: terraform output -raw ..._wif_provider)
-#   GCP_SERVICE_ACCOUNT    (from: terraform output -raw ..._service_account_email)
-# (Each repo gets its OWN service account, different values — see wif.tf)
+When it finishes, keep this terminal open — you'll copy values from it in the next steps.
 
-# In demo-app repo only, also add:
-#   GITOPS_APP_ID              (your GitHub App's ID)
-#   GITOPS_APP_PRIVATE_KEY     (the App's private key, full contents)
+---
 
-# ===== 3. Apply Argo CD configuration =====
+### STEP 3 — Get the Terraform outputs you'll need
+
+```bash
+# For the gke-argocd-gitops repo's CI secrets:
+terraform output -raw gitops_ci_wif_provider
+terraform output -raw gitops_ci_service_account_email
+
+# For the demo-app repo's CI secrets:
+terraform output -raw demo_app_ci_wif_provider
+terraform output -raw demo_app_ci_service_account_email
+
+# For logging into the Argo CD UI later:
+terraform output get_admin_password_command
+```
+
+> **Important:** always use `-raw`. Without it, Terraform wraps the value in quotes, and if you paste that (quotes included) into a GitHub secret, authentication will fail with a confusing "Invalid form of account ID" error.
+
+Copy all four values above somewhere safe (a text editor) — you'll paste them in Step 4.
+
+---
+
+### STEP 4 — Add GitHub Secrets to BOTH repos
+
+**In `gke-argocd-gitops` repo:**
+
+1. Go to the repo on GitHub → **Settings** tab → left sidebar → **Secrets and variables** → **Actions**
+2. Click **New repository secret**
+3. Add secret named `GCP_WIF_PROVIDER` → paste the `gitops_ci_wif_provider` value
+4. Click **New repository secret** again
+5. Add secret named `GCP_SERVICE_ACCOUNT` → paste the `gitops_ci_service_account_email` value
+
+**In `demo-app` repo — same steps, but different values:**
+
+1. `demo-app` repo → **Settings → Secrets and variables → Actions**
+2. Add `GCP_WIF_PROVIDER` → paste the `demo_app_ci_wif_provider` value
+3. Add `GCP_SERVICE_ACCOUNT` → paste the `demo_app_ci_service_account_email` value
+
+At this point, both repos can authenticate to Google Cloud. Next, we need `demo-app` to also be able to write into `gke-argocd-gitops` — that needs one more thing: a GitHub App.
+
+---
+
+### STEP 5 — Create a GitHub App (so `demo-app`'s CI can commit into `gke-argocd-gitops`)
+
+This is the part that's easy to forget a sub-step of. Go slowly here.
+
+1. Go to **`github.com/settings/apps`** (for a personal account) or your organization's equivalent
+2. Click **New GitHub App**
+3. Fill in:
+   - **GitHub App name**: anything unique, e.g. `gitops-bridge-<yourname>`
+   - **Homepage URL**: any valid URL, e.g. `https://github.com/<you>/gke-argocd-gitops` (it's not actually used for anything functional)
+   - **Webhook**: **uncheck** "Active" — we don't need webhooks
+4. Scroll to **Permissions → Repository permissions**:
+   - Find **Contents** → set to **Read and write**
+   - Leave everything else as "No access"
+5. Scroll down, choose **"Only on this account"**
+6. Click **Create GitHub App**
+
+**Now generate its private key:**
+
+7. On the App's settings page, scroll to **Private keys** → click **Generate a private key**
+8. A `.pem` file downloads automatically — **save it**, you cannot download it again (only generate a new one)
+
+**Now note the App ID:**
+
+9. At the top of the same settings page, you'll see **App ID** — a number (e.g. `123456`). Copy it.
+
+**Now install the App:**
+
+10. Left sidebar of the App's settings page → click **Install App**
+11. Choose your account/organization
+12. Select **"Only select repositories"** → choose `gke-argocd-gitops` **only**
+13. Click **Install**
+
+**Verify it worked:**
+
+14. Go to `github.com/settings/installations` — you should see your App listed, with `gke-argocd-gitops` under its repository access
+
+---
+
+### STEP 6 — Add the GitHub App secrets to `demo-app` repo
+
+1. `demo-app` repo → **Settings → Secrets and variables → Actions**
+2. Add secret `GITOPS_APP_ID` → paste the numeric App ID from Step 5.9
+3. Add secret `GITOPS_APP_PRIVATE_KEY` → open the downloaded `.pem` file in a text editor, copy **the entire contents** (including the `-----BEGIN...` and `-----END...` lines), paste all of it as the secret value
+
+At this point, `demo-app`'s CI can now securely write into `gke-argocd-gitops`, and the token it uses is generated fresh every single run — nothing here will ever expire on you.
+
+---
+
+### STEP 7 — (Recommended) Turn on branch protection
+
+1. `gke-argocd-gitops` repo → **Settings → Branches → Add branch protection rule**
+2. Branch name pattern: `main` → check **"Require a pull request before merging"**, and ideally **"Require approvals"** (at least 1)
+3. Repeat for `test` (same settings, or slightly lighter)
+4. Leave `develop` unprotected — CI needs to push there directly
+
+Also, still in Settings → **Actions → General** → scroll to **Workflow permissions** → make sure:
+- **"Read and write permissions"** is selected
+- **"Allow GitHub Actions to create and approve pull requests"** is checked (needed for `promote.yml` to open PRs)
+
+---
+
+### STEP 8 — Apply Argo CD's own configuration
+
+```bash
+cd gke-argocd-gitops
 kubectl apply -f argocd-config/
 kubectl apply -f argocd-projects/
+```
 
-# ===== 4. Bootstrap the App of Apps =====
+This sets up Argo CD's global RBAC, Slack notification rules, a custom health check, and the three `AppProject` permission boundaries (`dev`, `test`, `prod`).
+
+---
+
+### STEP 9 — Bootstrap the App of Apps (the one manual `kubectl apply` you'll ever run)
+
+```bash
 kubectl apply -f argocd-apps/root-app.yaml
-# Argo CD will now automatically create demo-app-dev, demo-app-test, demo-app-prod
+```
 
-# ===== 5. Trigger the first build =====
-cd ../../demo-app
+Within a minute or two, check that Argo CD created the three child Applications automatically:
+
+```bash
+kubectl get applications -n argocd
+# Expect to see: root-app, demo-app-dev, demo-app-test, demo-app-prod
+```
+
+---
+
+### STEP 10 — Log into the Argo CD UI (optional, but useful to see visually)
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+```
+
+Open your browser to `http://localhost:8080` (**http, not https** — we run Argo CD in insecure mode since TLS is meant to terminate at a GKE Ingress, not here).
+
+- Username: `admin`
+- Password: run the command from Step 3's `get_admin_password_command` output
+
+---
+
+### STEP 11 — Trigger your first real build
+
+```bash
+cd ../demo-app
 git commit --allow-empty -m "trigger first build"
 git push origin main
-# Watch GitHub Actions -> this builds an image and updates values-dev.yaml
+```
 
-# ===== 6. Watch it deploy automatically to dev =====
+Go to `demo-app` repo → **Actions** tab → watch the `CI - Build, Scan & Notify GitOps Repo` run. It will:
+1. Build the Docker image
+2. Scan it with Trivy
+3. Push it to Artifact Registry
+4. Commit a new image tag into `gke-argocd-gitops`'s `develop` branch (using the GitHub App token from Step 5)
+
+---
+
+### STEP 12 — Watch it deploy to `dev` automatically
+
+```bash
 kubectl get application demo-app-dev -n argocd
 kubectl get pods -n dev
-
-# ===== 7. Promote to test, then prod, whenever you're ready =====
-# GitHub -> Actions -> "Promote Image" -> Run workflow (see Part B above)
 ```
+
+Within a few minutes (Argo CD's default polling interval), you should see a pod running with your new image.
+
+---
+
+### STEP 13 — Promote to `test`
+
+1. Copy the current tag: `cat gke-argocd-gitops/apps/demo-app/values-dev.yaml`
+2. `gke-argocd-gitops` repo → **Actions** tab → **"Promote Image (Retag, Never Rebuild)"** → **Run workflow**
+3. Fill in: `target_env: test`, `image_tag: <the tag you copied>`, leave `release_version` blank
+4. Run it — it opens a Pull Request into the `test` branch
+5. Review and **merge** that PR
+6. Argo CD auto-syncs `test` within a few minutes
+
+---
+
+### STEP 14 — Promote to `prod`
+
+1. Copy the current tag from `values-test.yaml` this time
+2. Run "Promote Image" again: `target_env: prod`, `image_tag: <copied tag>`, `release_version: v1.0.0` (or your own version number)
+3. Review and merge the PR into `main`
+4. Prod does **not** auto-sync — trigger it deliberately:
+
+```bash
+argocd login localhost:8080 --username admin --password <your-password> --insecure
+argocd app diff demo-app-prod     # review what will change first
+argocd app sync demo-app-prod
+```
+
+5. Watch the canary rollout happen live:
+
+```bash
+kubectl argo rollouts get rollout demo-app-prod -n prod --watch
+```
+
+You now have a fully working, professional GitOps pipeline running end to end.
 
 ---
 
