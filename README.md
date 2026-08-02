@@ -1,646 +1,375 @@
-# GKE ArgoCD GitOps — Production-Grade Dev/Test/Prod on One Cluster
+# GKE + Argo CD GitOps Project — Complete Simple Guide
 
-A hands-on, advanced-level GitOps platform: **Argo CD** + **Argo Rollouts** managing **dev, test, and prod** on a single existing GKE cluster, using the **App of Apps** pattern, one environment-agnostic **Helm chart**, sync hooks, custom health checks, notifications, and layered RBAC.
-
-This README is written so a complete beginner can clone this repo and run it end-to-end, **and** so you can use it to genuinely prepare for an advanced ArgoCD/GitOps interview — every concept below is backed by a real file in this repo, not a textbook example.
+This README explains **everything** we built, in simple words. If you are new to Terraform, GitHub Actions, or Argo CD, you should be able to read this top to bottom and understand what is happening and why.
 
 ---
 
 ## Table of Contents
 
-1. [Introduction](#1-introduction)
-2. [Architecture](#2-architecture)
-3. [Repository Structure](#3-repository-structure)
-4. [Prerequisites](#4-prerequisites)
-5. [Core ArgoCD/GitOps Concepts](#5-core-argocdgitops-concepts)
-6. [Setting Up CI/CD Secrets (WIF)](#6-setting-up-cicd-secrets-workload-identity-federation)
-7. [Step-by-Step Setup](#7-step-by-step-setup)
-8. [Promotion Flow — Dev to Prod](#8-promotion-flow--dev-to-prod)
-9. [Verification Commands](#9-verification-commands)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Interview Questions](#11-interview-questions)
-12. [Future Improvements](#12-future-improvements)
+1. [What Is This Project?](#1-what-is-this-project)
+2. [The Two Repositories](#2-the-two-repositories)
+3. [Big Picture — How Everything Connects](#3-big-picture--how-everything-connects)
+4. [Part A: Terraform — Building the Foundation](#4-part-a-terraform--building-the-foundation)
+5. [Part B: GitHub Actions — The Automation](#5-part-b-github-actions--the-automation)
+6. [Part C: Argo CD — How Deployment Actually Happens](#6-part-c-argo-cd--how-deployment-actually-happens)
+7. [Branching Strategy](#7-branching-strategy)
+8. [Complete Step-by-Step Setup (From Zero)](#8-complete-step-by-step-setup-from-zero)
+9. [Bonus: What If We Had Separate GCP Accounts for Dev/Test/Prod?](#9-bonus-what-if-we-had-separate-gcp-accounts-for-devtestprod)
+10. [Common Problems and Fixes](#10-common-problems-and-fixes)
+11. [Interview Questions (Quick Reference)](#11-interview-questions-quick-reference)
 
 ---
 
-## 1. Introduction
+## 1. What Is This Project?
 
-Most "ArgoCD tutorial" content stops at "install Argo CD, sync one Application." This repo goes further, into the territory an advanced interview actually probes:
+We built a small web application (`demo-app`) and set up a **complete professional pipeline** to deploy it to a Kubernetes cluster on Google Cloud (GKE). The pipeline has three environments — **dev**, **test**, and **prod** — all running on the **same cluster**, safely separated.
 
-- **Sync hooks & sync waves** (ordering, PreSync migration-style checks)
-- **Drift handling** (`ignoreDifferences` for HPA/Rollout-managed fields)
-- **Progressive delivery** (Argo Rollouts canary in prod, not a plain rolling Deployment)
-- **Custom health checks** (teaching Argo CD to understand a CRD it's never seen)
-- **Notifications** (Slack on sync failure / prod deploy)
-- **Layered RBAC** (global `argocd-rbac-cm` + per-environment `AppProject` roles)
-- **App of Apps vs ApplicationSet** (both patterns present, one active, one documented)
+The two big ideas used everywhere in this project are:
 
-Only **one GCP account / one GKE cluster** is assumed — `dev`, `test`, and `prod` are three isolated namespaces on that same cluster, not three separate clusters.
+- **Infrastructure as Code** — nothing is created by clicking in the Google Cloud Console. Every resource (cluster access, service accounts, Argo CD installation) is written as Terraform code.
+- **GitOps** — nothing is deployed by typing `kubectl apply` by hand. Every deployment happens because someone pushed code to Git, and a tool called **Argo CD** noticed the change and applied it automatically.
 
 ---
 
-## 2. Architecture
+## 2. The Two Repositories
 
-```
-                        ┌───────────────────────────┐
-                        │   Existing GKE Cluster      │
-                        │  (built by gke-infra-       │
-                        │   terraform, a separate repo)│
-                        └─────────────┬─────────────┘
-                                      │ bootstrap/ (Terraform) installs onto it
-                                      ▼
-        ┌──────────────────────────────────────────────────────┐
-        │   argocd namespace         │   argo-rollouts namespace │
-        │   Argo CD (server,          │   Argo Rollouts controller │
-        │   repo-server, controller)  │   (canary engine for prod)  │
-        └──────────────┬───────────────────────────────────────┘
-                       │ watches this Git repo
-                       ▼
-        ┌──────────────────────────────────────────────────────┐
-        │        argocd-apps/root-app.yaml (App of Apps)          │
-        │   watches argocd-apps/environments/ → creates:           │
-        │        demo-app-dev  demo-app-test  demo-app-prod         │
-        └───────┬───────────────┬───────────────┬─────────────────┘
-                ▼               ▼               ▼
-        ┌──────────┐    ┌──────────┐    ┌────────────────────┐
-        │  dev ns   │    │  test ns  │    │  prod ns             │
-        │ Deployment │    │ Deployment │    │ Argo Rollouts canary │
-        │ auto-sync  │    │ auto-sync  │    │ MANUAL sync only     │
-        └──────────┘    └──────────┘    └────────────────────┘
-```
+We started with everything in **one** repository, but real companies never do that. So we split it into two, each with a clear, single job.
 
-CI for the app (`demo-app` repo's `.github/workflows/ci.yml`) never touches the cluster — it only builds the demo app's Docker image, scans it, pushes it, and commits a bumped image tag into THIS repo's `values-dev.yaml` (see Section 6's subsection on the two-repo split). That cross-repo Git commit is the entire "deploy" action; Argo CD does the rest.
+### Repo 1: `demo-app` — "The Code Repo"
 
----
-
-## 3. Repository Structure
-
-> **Note:** app source code (`app-src/`, the Flask app + Dockerfile) and its own `ci.yml` used to live directly in this repo. They've since moved to a separate `demo-app` repo — see Section 6's subsection on the two-repo split for why and how. This repo now only ever contains deployment config; Argo CD never looks at the app repo at all.
-
-```
-gke-argocd-gitops/
-├── bootstrap/                        # Terraform: installs Argo CD + Argo Rollouts + namespaces + WIF
-│   ├── providers.tf                  #   reads the EXISTING cluster via a data source
-│   ├── argocd.tf                     #   helm_release "argocd" + helm_release "argo_rollouts"
-│   ├── namespaces.tf                 #   dev/test/prod + ResourceQuota + NetworkPolicy
-│   ├── wif.tf                        #   shared WIF pool, one dedicated SA per trusted repo
-│   ├── artifact-registry.tf          #   the "demo-app" Docker repository
-│   └── ...
-├── argocd-config/                    # Cluster-wide Argo CD behavior (applied via kubectl)
-│   ├── argocd-rbac-cm.yaml            #   global RBAC policy
-│   ├── argocd-notifications-cm.yaml   #   Slack alerts
-│   └── argocd-cm-health-check.yaml    #   custom Lua health check for Job
-├── argocd-projects/                  # AppProject = RBAC + resource-kind boundary, per env
-├── argocd-apps/
-│   ├── root-app.yaml                  # THE App of Apps root — apply this once, by hand
-│   ├── environments/
-│   │   ├── dev-app.yaml               # auto-sync, tracks `develop`
-│   │   ├── test-app.yaml              # auto-sync, tracks `test`
-│   │   └── prod-app.yaml              # MANUAL sync, tracks `main` + ignoreDifferences + Slack subscriptions
-│   └── applicationset-example.yaml    # alternate pattern, documented, NOT active by default
-├── apps/demo-app/                    # ONE Helm chart, THREE values files
-│   ├── values-dev.yaml / values-test.yaml / values-prod.yaml
-│   └── templates/
-│       ├── deployment.yaml            # used when rollout.enabled = false (dev/test)
-│       ├── rollout.yaml               # used when rollout.enabled = true (prod) — canary
-│       ├── presync-hook-job.yaml      # PreSync hook, sync-wave "-1"
-│       ├── hpa.yaml                   # targets Deployment OR Rollout automatically
-│       └── service.yaml / ingress.yaml / serviceaccount.yaml
-└── .github/workflows/promote.yml     # the ONLY workflow left in this repo — retag + open promotion PR
-```
-
-**The separate `demo-app` repo** now looks like this:
+This is where the actual application lives.
 
 ```
 demo-app/
-├── app.py
-├── requirements.txt
-├── Dockerfile
-└── .github/workflows/ci.yml          # build → Trivy scan → push → bump THIS repo's values-dev.yaml (cross-repo commit)
+├── app.py                          # the actual Python (Flask) application
+├── requirements.txt                # Python dependencies
+├── Dockerfile                      # how to package the app into a container image
+└── .github/workflows/ci.yml        # builds, scans, and pushes the image
+```
+
+Only developers work here. They never need to touch Kubernetes, Argo CD, or Terraform.
+
+### Repo 2: `gke-argocd-gitops` — "The Deployment Repo"
+
+This is where we describe **how** and **where** the app should run.
+
+```
+gke-argocd-gitops/
+├── bootstrap/            # Terraform — sets up Argo CD, namespaces, service accounts
+├── apps/demo-app/        # a Helm chart — the actual Kubernetes YAML template for our app
+├── argocd-apps/          # Argo CD "Application" objects — one per environment
+├── argocd-projects/      # Argo CD "AppProject" objects — permission boundaries
+├── argocd-config/        # Argo CD settings — RBAC, Slack alerts, custom health checks
+└── .github/workflows/promote.yml   # moves a tested image from one environment to the next
+```
+
+Only the platform/DevOps side touches this repo. Argo CD only ever watches **this** repo — it has no idea `demo-app` even exists.
+
+### Why split them at all?
+
+Imagine a junior developer accidentally pushes bad code. If everything was in one repo, that same push could theoretically touch production deployment settings too. By splitting the repos, a code change can **only** affect the `demo-app` repo. It takes a **separate, deliberate action** (the `promote.yml` workflow) to actually move that code toward production.
+
+---
+
+## 3. Big Picture — How Everything Connects
+
+```
+ Developer writes code
+        │
+        ▼
+ Pushes to demo-app repo (main branch)
+        │
+        ▼
+ GitHub Actions in demo-app: builds Docker image, scans it for security bugs,
+ pushes it to Google Artifact Registry, then quietly sends a message into the
+ gke-argocd-gitops repo saying "here is the new image tag for dev"
+        │
+        ▼
+ Argo CD (running inside our GKE cluster) sees that gke-argocd-gitops repo
+ changed, and automatically updates the "dev" environment
+        │
+        ▼
+ We test it in dev. If good, we run "promote.yml" (a manual button click)
+ to move that SAME image (not rebuilt!) into test, then later into prod
+        │
+        ▼
+ Prod requires one more manual click to confirm the sync — nothing goes to
+ production without a human saying "yes, go"
 ```
 
 ---
 
-## 4. Prerequisites
+## 4. Part A: Terraform — Building the Foundation
 
-- The GKE cluster from the separate `gke-infra-terraform` repo already exists and is reachable
-- `kubectl`, `helm`, `terraform`, and the [Argo CD CLI](https://argo-cd.readthedocs.io/en/stable/cli_installation/) installed locally
-- `GCP_WIF_PROVIDER` / `GCP_SERVICE_ACCOUNT` GitHub secrets configured **for THIS repo specifically** — do not reuse the infra repo's secrets, they won't work here. This repo has its own dedicated `bootstrap/wif.tf` (a separate Workload Identity Pool, trusting only this repository) — see [Section 6](#6-setting-up-cicd-secrets-workload-identity-federation) for the exact commands.
+All the Terraform code lives inside the `bootstrap/` folder of `gke-argocd-gitops`. Think of Terraform as "instructions to Google Cloud" written in a file, instead of clicking buttons on a website.
 
----
+We do **not** use Terraform to create the GKE cluster itself in this repo — that cluster already exists (built earlier, by a separate infra project). This `bootstrap/` folder only installs things **on top of** that existing cluster.
 
-## 5. Core ArgoCD/GitOps Concepts
+### What each file does (in simple words)
 
-### What Is Argo CD, and How Do You Actually Use It?
-
-Argo CD is a program that runs *inside* your Kubernetes cluster and does one job, continuously: **watch a Git repo, and make the cluster match what's in it.** You never run `kubectl apply` yourself for anything Argo CD manages — you push to Git, and Argo CD notices and applies it for you (or, for `prod`, notices and *waits for you to say go*).
-
-In day-to-day use, you interact with Argo CD in three ways:
-1. **The Web UI** (`kubectl port-forward svc/argocd-server -n argocd 8080:443`, then open `http://localhost:8080`) — a visual tree of every Application, its sync/health status, and its live Kubernetes resources
-2. **The `argocd` CLI** (`argocd app sync`, `argocd app diff`, `argocd app get`) — the same actions as the UI, scriptable
-3. **`kubectl`, directly on the `Application`/`AppProject` custom resources** — since they're just Kubernetes objects, `kubectl get application demo-app-test -n argocd` works even without the CLI or UI, which is what saved us multiple times in this conversation when port-forwarding kept dying
-
-### Argo CD's Components — What Each One Actually Does
-
-Argo CD isn't one program — it's ~7 small components (Kubernetes Deployments/StatefulSets) working together, all in the `argocd` namespace. Understanding what each one does makes every error message in this conversation make sense in hindsight:
-
-| Component | What it actually does | Where you saw it in this conversation |
+| File | What it creates | Why we need it |
 |---|---|---|
-| **`argocd-server`** | The API server — everything else (UI, CLI, `kubectl` reads of Application status) talks to this. It's the one component with a `Service` you port-forward to. | The `CreateContainerError` / `ImagePullBackOff` pod we debugged earlier |
-| **`argocd-repo-server`** | Clones your Git repo and *renders* it — runs `helm template` (or `kustomize build`) to turn your chart + values file into plain Kubernetes YAML. It doesn't talk to the cluster at all, only to Git and Helm. | Was stuck `Init:0/1` during the resource-starvation incident |
-| **`argocd-application-controller`** | The actual brain — the reconciliation loop. Every few minutes (or on a webhook/manual trigger) it asks the repo-server "what SHOULD exist," compares that to what actually exists in the cluster (via the Kubernetes API), and decides what to create/update/delete. This is what sets `SYNC STATUS` and `APP HEALTH`. | Reported `OutOfSync`/`Missing` when the AppProject blocked `ServiceAccount` |
-| **`argocd-redis`** | A cache — stores rendered manifests and cluster state so the controller/repo-server don't redo expensive work on every reconciliation loop. | Was actually the one component that stayed healthy through all our troubleshooting |
-| **`argocd-dex-server`** | An SSO/OIDC bridge (lets you log in with GitHub/Google/etc instead of the static `admin` password). **Disabled in this repo** (`dex.enabled: false` in `bootstrap/argocd.tf`) — no SSO is wired up yet, so running it would just waste resources on an already-tight node pool | Was one of the pods stuck `Init:0/1` before we disabled it |
-| **`argocd-notifications-controller`** | Watches Application status changes and fires alerts (Slack, in this repo) based on the trigger/template rules in `argocd-config/argocd-notifications-cm.yaml` | Configured, not yet exercised in this conversation |
-| **`argocd-applicationset-controller`** | Powers the `ApplicationSet` resource — generates multiple `Application` objects from one template + a generator (list, git, cluster, etc). Not doing anything right now since this repo uses App of Apps instead (`applicationset-example.yaml` is inert, documented only) | N/A currently |
+| `providers.tf` | Tells Terraform: "here is the existing GKE cluster, connect to it" | Terraform needs to know WHERE to send its commands |
+| `namespaces.tf` | Creates 3 folders inside the cluster — `dev`, `test`, `prod` (called "namespaces" in Kubernetes) | Keeps the 3 environments separate on the same cluster, like 3 separate rooms in one house |
+| | Also sets a limit on how much CPU/memory each namespace can use ("ResourceQuota") | So `dev` experiments can never accidentally eat all the resources and break `prod` |
+| | Also blocks network traffic between namespaces ("NetworkPolicy") | So a `dev` pod can never accidentally talk to a `prod` pod |
+| `argocd.tf` | Installs Argo CD itself, and Argo Rollouts (for advanced deployments), using Helm | This is the actual "brain" that will watch our Git repo and deploy things |
+| `wif.tf` | Sets up a secure, passwordless way for GitHub Actions to talk to Google Cloud | Explained fully in Part B below |
+| `artifact-registry.tf` | Creates a storage space in Google Cloud for our Docker images | Every image we build needs somewhere to live |
+| `backend.tf` | Tells Terraform WHERE to save its own memory file (called "state") | So Terraform remembers what it already created, and doesn't create things twice |
 
-### `Application` vs `AppProject`
+### Terraform commands you actually run
 
-An **`Application`** is "deploy THIS Helm chart/path, from THIS repo/revision, to THIS namespace" — one per environment here (`demo-app-dev`, `demo-app-test`, `demo-app-prod`). An **`AppProject`** is the security boundary around a group of Applications: which repos they may pull from, which destination namespaces they may write to, which Kubernetes *kinds* they're allowed to create (`namespaceResourceWhitelist`), and which RBAC roles exist inside that boundary. Every Application in this repo belongs to exactly one AppProject.
-
-### Automated vs Manual Sync
-
-`syncPolicy.automated { prune: true, selfHeal: true }` (dev/test) means Argo CD applies Git changes the moment it sees them, and reverts any manual `kubectl edit` back to match Git within minutes. **Omitting `automated` entirely** (prod) means Argo CD only ever computes and shows a diff — a human must run `argocd app sync demo-app-prod` to actually apply it. Git is still the single source of truth either way; only the *timing* of application changes.
-
-### Sync Waves vs Sync Hooks
-
-These solve different problems and get confused constantly:
-- **Sync waves** (`argocd.argoproj.io/sync-wave: "-1"`) control **order** among normal resources within the *same* sync operation — lower numbers apply first.
-- **Sync hooks** (`argocd.argoproj.io/hook: PreSync`) mark a resource as running at a specific *phase* of the sync lifecycle (`PreSync`, `Sync`, `PostSync`, `SyncFail`) — outside the normal resource list entirely, and Argo CD waits for it to complete before continuing.
-
-This repo's `presync-hook-job.yaml` uses **both**: it's a `PreSync` hook (runs before the main sync), and also carries `sync-wave: "-1"` (in case multiple PreSync hooks exist later and need their own order).
-
-### `ignoreDifferences` — Drift That's Supposed to Happen
-
-`prod-app.yaml` ignores `/spec/replicas` on the `Rollout` resource, because the HPA constantly changes that field outside of Git. Without `ignoreDifferences`, Argo CD would either show prod as permanently `OutOfSync`, or — worse, with `selfHeal` on — fight the HPA every reconciliation loop. `ignoreDifferences` tells Argo CD "this specific field is allowed to diverge from Git; don't treat it as drift."
-
-### Health Checks — Built-in and Custom
-
-Argo CD ships with built-in health logic for common kinds (a `Deployment` is "Healthy" once its replicas are all ready). It does **not** know how to judge health for arbitrary CRDs. `argocd-config/argocd-cm-health-check.yaml` teaches it, via a small Lua script, how to read a `Job`'s `.status.succeeded`/`.status.failed` fields and report `Healthy`/`Degraded`/`Progressing` accordingly — the exact mechanism you'd use for any custom CRD your org builds.
-
-### Notifications
-
-`argocd-notifications-cm.yaml` defines **triggers** (when to fire — e.g. `on-sync-failed`), **templates** (what message to send), and **subscriptions** (which Slack channel). Prod additionally gets its own dedicated channel via annotations directly on `prod-app.yaml`, so a failed prod deploy pages someone instead of getting lost in routine dev/test noise.
-
-### RBAC — Two Layers, Not One
-
-`argocd-projects/*.yaml`'s `roles` answer **"what can this identity do inside THIS project?"** `argocd-config/argocd-rbac-cm.yaml` answers **"what can this identity do across Argo CD as a whole?"** — e.g., only `platform-admins` get `role:admin` globally, while `developers` only ever get project-scoped `dev/*` permissions. Both layers apply together; the effective permission is the most restrictive one that matches.
-
-### App of Apps vs ApplicationSet
-
-**App of Apps** (`root-app.yaml`, the pattern actually active here): one explicit YAML file per environment, full control over every field (different `syncPolicy`, different `ignoreDifferences`, different notification channel — as seen comparing `prod-app.yaml` to `dev-app.yaml`). Best when environments are **few and genuinely different**.
-
-**ApplicationSet** (`applicationset-example.yaml`, documented but not active): one generator template stamps out N nearly-identical Applications automatically. Best when you have **many** near-identical targets (dozens of microservices, or many customer clusters) where per-target YAML would be pure repetition. This repo demonstrates both so you can speak to the trade-off directly in an interview.
-
-### Progressive Delivery — Argo Rollouts Canary (Deep Dive)
-
-**The problem with a plain `Deployment`:** its rolling update only asks "is the new pod's readiness probe passing?" It has no concept of *how much* traffic the new version is getting, and no built-in pause for a human (or a metrics check) to say "wait, something looks wrong" before 100% of users hit the new code.
-
-**What a `Rollout` (Argo Rollouts' CRD) adds:** the exact same Deployment-like pod template, but a `strategy.canary` block that controls the update *gradually*, with real stopping points:
-
-```yaml
-strategy:
-  canary:
-    steps:
-      - setWeight: 20
-      - pause: { duration: 60 }
-      - setWeight: 50
-      - pause: { duration: 120 }
-      - setWeight: 100
+```bash
+cd bootstrap
+terraform init      # downloads the tools Terraform needs
+terraform plan       # shows you WHAT WILL CHANGE (a dry run, nothing happens yet)
+terraform apply      # actually creates everything
 ```
 
-Here's a real, live example — this is the actual output from this project's prod rollout, fully finished:
+Always read the `plan` output carefully before typing `apply` — this is your only chance to catch a mistake before it becomes real.
+
+---
+
+## 5. Part B: GitHub Actions — The Automation
+
+We use **two different GitHub Actions workflows**, one in each repo, each doing a very different job.
+
+### Workflow 1: `demo-app/.github/workflows/ci.yml` ("Build")
+
+This runs every time code is pushed to `demo-app`'s `main` branch. In simple steps:
+
+1. **Log in to Google Cloud** — using something called **Workload Identity Federation (WIF)**. This is important: we never store a Google Cloud password or key file anywhere in GitHub. Instead, GitHub proves its own identity with a short-lived, auto-expiring token, and Google Cloud trusts it (only for this exact repository). This is much safer than a password that never expires.
+2. **Build the Docker image** — packages our app into a container, tagged with the Git commit ID (e.g. `sha-a1b2c3d`). This tag never changes for this exact build — it is permanent.
+3. **Scan the image with Trivy** — a security tool that checks for known vulnerabilities. If a serious, fixable problem is found, the whole pipeline **stops** — the bad image never gets pushed anywhere.
+4. **Push the image** to Artifact Registry.
+5. **Tell the gke-argocd-gitops repo** — this step checks out the *other* repo and edits one file (`values-dev.yaml`) to say "use this new image tag," then commits and pushes that change. This is the one tricky part: since this is a *different* repository, GitHub's normal built-in token doesn't have permission to write there. We solved this using a **GitHub App**, which generates a short-lived permission token fresh every single run — nothing to manually renew, ever.
+
+### Workflow 2: `gke-argocd-gitops/.github/workflows/promote.yml` ("Promote")
+
+This does **not** build anything. It only **moves** an already-built, already-tested image from one environment to the next. You run it manually, whenever you decide something is ready to promote.
+
+You give it 2-3 inputs:
+- `target_env` — `test` or `prod`
+- `image_tag` — the exact tag you copy from the current environment's values file
+- `release_version` — only for prod, a friendly name like `v1.2.0`
+
+It then:
+1. Checks that the image tag genuinely exists (so a typo fails immediately, loudly)
+2. For prod, also creates a friendly alias tag pointing at the exact same image (never a new build)
+3. Updates the target environment's values file with the new tag
+4. Opens a **Pull Request** — it never pushes directly, because a human should always review a promotion to `test` or `prod` before it happens
+
+### Why is the image never rebuilt during promotion?
+
+This is called **"build once, promote everywhere."** If we rebuilt the app separately for test and separately for prod, we could no longer be 100% sure it's the exact same code that was tested. By only ever re-tagging (never rebuilding), the artifact that reaches production is guaranteed to be byte-for-byte identical to what passed testing.
+
+---
+
+## 6. Part C: Argo CD — How Deployment Actually Happens
+
+### What is Argo CD, really?
+
+Argo CD is a program running inside our cluster whose only job is: **look at a Git repo, and make the cluster match it.** You never manually deploy anything — you change a file in Git, and Argo CD notices and copies that change into the cluster.
+
+### Argo CD's Components (the actual pods running inside it)
+
+| Component | Simple explanation |
+|---|---|
+| **argocd-server** | The front door — the web UI and the API that the CLI/UI talk to |
+| **argocd-repo-server** | Reads our Git repo and "renders" the Helm chart into real Kubernetes YAML |
+| **argocd-application-controller** | The real brain — constantly compares "what Git says should exist" with "what actually exists," and fixes any difference |
+| **argocd-redis** | A cache, so the above two don't repeat expensive work every time |
+| **argocd-dex-server** | Handles login via GitHub/Google (SSO) — **turned off** in our setup right now, since we haven't configured SSO yet |
+| **argocd-notifications-controller** | Sends Slack alerts when something succeeds or fails |
+| **argocd-applicationset-controller** | Can auto-generate many "Application" objects from one template (we have an example of this but don't actually use it — see below) |
+
+### `Application` and `AppProject` — the two key objects
+
+An **Application** is one specific instruction: "deploy this Helm chart, from this Git branch, into this namespace." We have three: `demo-app-dev`, `demo-app-test`, `demo-app-prod`.
+
+An **AppProject** is a permission boundary around one or more Applications — which Git repo they may use, which namespace they may write to, and which Kubernetes object types they're even allowed to create. We have three: `dev`, `test`, `prod`.
+
+### "App of Apps" — how we manage 3 Applications easily
+
+Instead of manually creating each of the 3 Applications by hand, we created **one Application called `root-app`** that watches a folder (`argocd-apps/environments/`). Whatever `Application` YAML files exist in that folder, Argo CD creates automatically. Want a 4th environment later? Just add one more file there.
+
+### Sync Policy — the most important setting per environment
+
+| Environment | Sync Policy | What it means |
+|---|---|---|
+| `dev` | Automatic (`prune: true`, `selfHeal: true`) | The moment Git changes, Argo CD applies it — no human needed |
+| `test` | Automatic | Same as dev — fast feedback for QA |
+| `prod` | **Manual** (no automated block at all) | Argo CD only shows "this is out of date" — a human must explicitly run `argocd app sync` |
+
+### Sync Hooks and Sync Waves
+
+Before deploying to `test` or `prod`, we run a small "check" Job first (imagine it as a placeholder for a real database migration script). This uses a feature called a **PreSync Hook** — Argo CD runs this Job *before* touching anything else, and waits for it to finish successfully.
+
+### Argo Rollouts — Canary Deployment for Prod
+
+In `dev` and `test`, when a new version is deployed, all old pods are replaced with new ones fairly quickly (a normal "rolling update"). In `prod`, we use something smarter: a **canary deployment**.
+
+Instead of switching 100% of pods immediately, it goes in steps:
 
 ```
-Status:          ✔ Healthy
-Strategy:        Canary
-  Step:          5/5
-  SetWeight:     100
-  ActualWeight:  100
-Images:          .../demo-app:v1.0.0 (stable)
-Replicas:
-  Desired:       3    Current: 3    Updated: 3    Ready: 3    Available: 3
+20% new version → WAIT 60 seconds → 50% new version → WAIT 120 seconds → 100% new version
 ```
 
-Walking through what actually happened, step by step:
-
-1. **`setWeight: 20`** — Argo Rollouts scales up 1 new-version pod (roughly 20% of the eventual 3 replicas) while keeping the old-version pods running alongside it. Both versions are live at once.
-2. **`pause: { duration: 60 }`** — the rollout **stops here for 60 seconds**, on purpose, giving you a window to look at logs/metrics/errors and decide if this looks wrong. `kubectl argo rollouts get rollout demo-app-prod -n prod` at this exact moment would show `Step: 2/5, SetWeight: 20` and pods from BOTH the old and new ReplicaSet.
-3. **`setWeight: 50`** — scales the new version up further, old version down further.
-4. **`pause: { duration: 120 }`** — another deliberate stop, longer this time.
-5. **`setWeight: 100`** — the old ReplicaSet is fully scaled to 0, only the new version remains. `Step: 5/5` and `ActualWeight: 100` — exactly what the output above shows.
-
-**An honest, important clarification** (this matters for an interview — don't overstate it): this repo's `rollout.yaml` has **no `trafficRouting` block configured** (no Istio, no NGINX canary annotations, no service mesh). That means Argo Rollouts is doing **replica-ratio canary**, not true HTTP-level traffic splitting. "20% weight" here means *roughly 20% of the pods behind the Service are the new version* — since a normal Kubernetes `Service` load-balances round-robin-ish across all its endpoint pods, request traffic *approximately* follows that same ratio, but it's not a precisely-enforced percentage the way a service mesh's traffic-shaping would guarantee. For true precise traffic-percentage control, you'd add a `trafficRouting` block pointing at Istio/NGINX/SMI — a real next step, listed in Future Improvements.
-
-**Rolling back mid-canary** — if a pause step reveals a problem:
+During each "WAIT" step, both the old and new versions are running side-by-side. If something looks wrong, we can run one command to instantly cancel and go back to the old version:
 
 ```bash
 kubectl argo rollouts abort demo-app-prod -n prod
 ```
 
-This immediately scales the new ReplicaSet back to 0 and the old (stable) one back to full — no new Git commit, no new promotion, no waiting. It's the fastest recovery path this whole platform has, precisely because it happens entirely inside the cluster, bypassing Git/CI/Argo CD sync altogether.
-
-**Why only prod uses this, not dev/test:** canary analysis exists to protect real users from a bad release. Before code has even been through code review (dev) or QA sign-off (test), there's no "real traffic" worth protecting yet — a plain `Deployment`'s rolling update is simpler and faster, appropriately.
+**Honest note:** our current setup shifts traffic *approximately*, based on the ratio of old-pods to new-pods behind the same Service (this is called "replica-ratio canary"). For a precise, guaranteed traffic percentage, you would add a service mesh like Istio — that's listed as a future improvement.
 
 ---
 
-## 6. Setting Up CI/CD Secrets (Workload Identity Federation)
+## 7. Branching Strategy
 
-This repo's own `bootstrap/wif.tf` creates a **dedicated, least-privilege** Workload Identity Pool + service account just for this repo's CI — completely separate from the `gke-infra-terraform` repo's own WIF setup (see the comment block at the top of that file for why they must be separate, not shared).
+We use **different branching styles in each repo**, on purpose, because each repo has a different job.
 
-```bash
-cd bootstrap
-terraform apply   # also creates the WIF pool/provider/SA, alongside Argo CD
+### `demo-app` repo — Trunk-Based (simple)
 
-terraform output gitops_ci_wif_provider          # → copy into GitHub secret GCP_WIF_PROVIDER
-terraform output gitops_ci_service_account_email # → copy into GitHub secret GCP_SERVICE_ACCOUNT
+```
+main   (the only long-lived branch)
+  │
+  ├── feature/xyz     (temporary — created, worked on, merged, then deleted)
+  └── fix/abc          (temporary)
 ```
 
-In your GitHub repo: **Settings → Secrets and variables → Actions → New repository secret**, add both. `.github/workflows/ci.yml` picks them up automatically on the next push — no other configuration needed. This CI identity can **only** push images to Artifact Registry (`roles/artifactregistry.writer`); it has no access to the cluster, Cloud SQL, or anything else — if it ever leaked, the blast radius is "can push a Docker image," nothing more.
+Developers create a short branch, make a Pull Request into `main`, get it reviewed, and merge. Every merge into `main` triggers the CI workflow. There is no `dev`/`test`/`prod` branch here — the app repo does not need to know or care about environments at all.
 
-### Splitting the App Source into Its Own Repo (the Real-World Pattern)
+### `gke-argocd-gitops` repo — Environment Branches
 
-This repo previously kept `app-src/` (the Flask app + Dockerfile) alongside all the GitOps/Terraform/Helm config — fine for learning end-to-end in one place, but not how real teams structure this. In production, application source and deployment config live in **separate repositories**, and Argo CD only ever watches the GitOps one — it's completely blind to the app repo's existence.
+```
+develop  →  maps to  →  dev environment    (auto-sync)
+test     →  maps to  →  test environment   (auto-sync)
+main     →  maps to  →  prod environment   (MANUAL sync)
+```
 
-**Why split them:**
-- **Access control** — app developers need `contents: write` on their own repo to ship code. They should never need write access to `argocd-projects/*.yaml` (RBAC), `bootstrap/` (Terraform), or `values-prod.yaml`'s sync policy. One repo makes that separation impossible; two repos make it the default.
-- **Blast radius** — if the app repo (and its dependencies) gets compromised, the attacker has, at absolute worst, `roles/artifactregistry.writer` — they cannot touch the cluster, Terraform state, or Argo CD config, because those simply aren't reachable from that repo's CI identity.
-- **Independent history/noise** — the app repo's commit history is pure feature work; the GitOps repo's history is pure "what's deployed where," each easy to audit on its own.
+- `develop` — CI pushes here directly and automatically. No protection needed.
+- `test` — only reachable through a reviewed Pull Request (usually via `promote.yml`).
+- `main` — the most protected branch. Requires a Pull Request, at least one human reviewer, and (ideally) passing checks. This is production — treat it that way.
 
-**Migration steps:**
+### Why this asymmetry is correct
 
-1. Create a new repo (e.g. `demo-app`), move `app-src/`'s contents into its root, push to `main`
-2. Extend `bootstrap/wif.tf` (already done in this revision) — reuse the **same** Workload Identity Pool, but add a **second, fully isolated** service account (`demo-app-ci-sa`) bound only to the new repo. The pool's `attribute_condition` becomes a short allow-list (`assertion.repository in [...]`) instead of a single `==` check
-3. `terraform apply` in `bootstrap/`, then add `GCP_WIF_PROVIDER`/`GCP_SERVICE_ACCOUNT` secrets to the **new** `demo-app` repo (values come from `demo_app_ci_wif_provider`/`demo_app_ci_service_account_email` outputs — different from the gitops repo's own secrets, even though it's the same pool)
-4. Create a **GitHub App**, not a personal access token — a PAT would work too, but GitHub *mandates* an expiry on fine-grained PATs (max 1 year), meaning a PAT would silently break this pipeline on some future date nobody's watching for. A GitHub App's installation token is minted fresh on every single run (~1 hour lifetime, auto-discarded) from a private key that itself never expires — nothing to remember to rotate on a schedule:
-   - Create the App under the account that owns `gke-argocd-gitops`, with **Contents: Read and write** permission, no webhook
-   - Generate and download its private key
-   - Install the App on ONLY the `gke-argocd-gitops` repo
-   - Add two secrets to the `demo-app` repo: `GITOPS_APP_ID` (the App's ID) and `GITOPS_APP_PRIVATE_KEY` (the full contents of the downloaded key)
-5. The app repo's own `ci.yml` builds/scans/pushes exactly like before, then generates a fresh App token, checks out `gke-argocd-gitops` with it, and bumps `values-dev.yaml` there — the only functional change from the old single-repo CI
-6. Delete `app-src/` and the old build-focused `ci.yml` from this repo entirely — `promote.yml` (and everything else here) is unaffected, since promotion was always about *this* repo's own values files, never about app source
-7. **Simpler fallback, if a GitHub App feels like overkill for a small/personal project:** an SSH **deploy key** (added to `gke-argocd-gitops` with write access, private half stored as a `demo-app` secret) also never expires by default and needs zero extra infrastructure — the trade-off is it's scoped to one repo permanently and can't be centrally revoked/audited the way a GitHub App installation can
+The app repo answers the question "what is the current best code?" The deployment repo answers a completely different question: "what is running in each environment, right now?" Mixing these two questions into one branch model creates confusion. Keeping them separate keeps each repo's job simple and obvious.
 
-**Branching strategy — deliberately NOT symmetric between the two repos:**
+---
 
-| | `demo-app` (app repo) | `gke-argocd-gitops` (this repo) |
-|---|---|---|
-| Branches | `main` only — trunk-based | `develop` / `test` / `main` — environment-mapped |
-| What a branch means | "the current state of the source code" | "what's deployed in that environment" |
-| How code gets in | Feature branch → PR → merge to `main` | `promote.yml`-generated PR → merge |
-| Does it need dev/test/prod branches? | **No** — environment concerns don't belong here at all | Yes — this is the ONLY place that concept exists |
-
-This asymmetry is the whole point: application developers get a boring, standard, single-branch trunk workflow (no need to ever think about "which environment"), while environment promotion — a platform/release-management concern — lives entirely in the GitOps repo, touched only by whoever runs `promote.yml`.
-
-## 7. Step-by-Step Setup
+## 8. Complete Step-by-Step Setup (From Zero)
 
 ```bash
-# 1. Install Argo CD + Argo Rollouts + create dev/test/prod namespaces
-cd bootstrap
+# ===== 1. Bootstrap: install Argo CD, Argo Rollouts, namespaces, WIF =====
+cd gke-argocd-gitops/bootstrap
 terraform init
 terraform apply
 
-# 2. Get the initial Argo CD admin password
-terraform output get_admin_password_command   # run the printed command
+# Get Argo CD's initial admin password
+terraform output get_admin_password_command   # run the command it prints
 
-# 3. Access the Argo CD UI
-kubectl port-forward svc/argocd-server -n argocd 8080:443
-# open https://localhost:8080 → log in as `admin`
+# ===== 2. Add GitHub Secrets =====
+# In BOTH repos (demo-app, gke-argocd-gitops), add:
+#   GCP_WIF_PROVIDER       (from: terraform output -raw ..._wif_provider)
+#   GCP_SERVICE_ACCOUNT    (from: terraform output -raw ..._service_account_email)
+# (Each repo gets its OWN service account, different values — see wif.tf)
 
-# 4. Apply cluster-wide Argo CD config (RBAC, notifications, custom health check)
+# In demo-app repo only, also add:
+#   GITOPS_APP_ID              (your GitHub App's ID)
+#   GITOPS_APP_PRIVATE_KEY     (the App's private key, full contents)
+
+# ===== 3. Apply Argo CD configuration =====
 kubectl apply -f argocd-config/
-
-# 5. (If using Slack notifications) create the token secret first
-kubectl create secret generic argocd-notifications-secret -n argocd \
-  --from-literal=slack-token=<xoxb-your-slack-bot-token>
-
-# 6. Apply the AppProjects
 kubectl apply -f argocd-projects/
 
-# 7. Bootstrap the App of Apps — the ONLY Application you ever apply by hand
+# ===== 4. Bootstrap the App of Apps =====
 kubectl apply -f argocd-apps/root-app.yaml
+# Argo CD will now automatically create demo-app-dev, demo-app-test, demo-app-prod
 
-# Argo CD now creates demo-app-dev, demo-app-test, and demo-app-prod on its
-# own. dev/test start auto-syncing immediately; prod waits for a manual sync.
-```
+# ===== 5. Trigger the first build =====
+cd ../../demo-app
+git commit --allow-empty -m "trigger first build"
+git push origin main
+# Watch GitHub Actions -> this builds an image and updates values-dev.yaml
 
----
-
-## 8. Promotion Flow — Dev to Prod
-
-### Branching Strategy
-
-```
-develop  →  Application: demo-app-dev   →  dev namespace   →  AUTO-sync
-test     →  Application: demo-app-test  →  test namespace  →  AUTO-sync
-main     →  Application: demo-app-prod  →  prod namespace  →  MANUAL sync
-```
-
-`main` is the protected, production branch here — same convention GitHub itself assumes by default (branch protection, required reviews, required status checks all make sense on `main` specifically because it now genuinely represents "what's in production"). `develop` is where day-to-day CI activity happens; `test` and `main` are only ever reached through a reviewed Pull Request, never a direct push.
-
-Recommended GitHub branch protection:
-- `develop`: no protection needed — CI pushes here directly, meant to be fast and disposable
-- `test`: require a PR (no direct pushes) — at least one reviewer
-- `main`: require a PR + at least one reviewer + required CI status checks passing — this is production
-
-### Image Tagging Strategy — Build Once, Promote Everywhere
-
-> **Repo split note:** `ci.yml` referenced throughout this section now lives in the separate `demo-app` repo (Section 6), and its "push to `develop`" is a cross-repo commit into *this* repo — functionally identical to before, just originating from a different repo's Actions run.
-
-This is a core GitOps principle this repo previously didn't fully enforce: **an image is built exactly once**, then the *same artifact* moves through dev → test → prod. Nothing is ever rebuilt for a "promotion" — only re-tagged and referenced.
-
-- `ci.yml` (in the `demo-app` repo, triggered by pushes to its `main`) tags every build as `sha-<7-char-git-sha>` — an immutable identity, not "the dev tag." It writes this straight into `values-dev.yaml`.
-- `promote.yml` (manual, `workflow_dispatch`) takes an **already-built, already-Trivy-scanned** `sha-xxxxx` tag and:
-  1. Verifies it actually exists in Artifact Registry (fails loudly if you typo it — this is exactly the mistake that broke `test` earlier: a placeholder tag that was never real)
-  2. Resolves its immutable **digest**
-  3. For `prod` only, optionally creates a human-readable alias tag (e.g. `v1.2.0`) pointing at that *same* digest — a retag, never a rebuild
-  4. Bumps `values-test.yaml` or `values-prod.yaml` with the new tag (and, for prod, the resolved **digest** too)
-  5. Opens a **Pull Request** into `test`/`main` — it never pushes directly, since those branches are protected and still need human review
-
-`values-prod.yaml` sets both `image.tag` (cosmetic, human-readable) and `image.digest` (the actual immutable pin the Helm chart renders — see `deployment.yaml`/`rollout.yaml`'s `{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}`). A tag can technically be silently repointed at a different image later; a digest physically cannot — prod gets the strictest guarantee available.
-
-### `promote.yml` Safety Guarantees
-
-Running the same promotion twice, or two promotions racing each other, should never corrupt anything. `promote.yml` is built specifically to guarantee:
-
-| Guarantee | How |
-|---|---|
-| No `non-fast-forward` push errors | Every run creates a branch named `promote/<env>-<tag>-<run_id>` — unique per workflow run, never collides with a leftover branch from an earlier attempt |
-| No duplicate PRs | Before creating a PR, it checks `gh pr list --head <branch>` first — a retry of the same run reuses the existing PR instead of erroring |
-| Skips if already promoted | Reads the target values file's current `tag` (and `digest`, for prod) BEFORE touching anything — if they already match what's being promoted, it exits cleanly with no PR, no commit, no registry call |
-| No empty commits | `git diff --quiet` gate right before committing — a no-op `sed` (already-correct value) never produces a commit |
-| One promotion per environment at a time | `concurrency: group: promote-<target_env>` — a second run targeting the SAME environment queues behind the first instead of racing it; `test` and `prod` promotions can still run in parallel since they're different groups |
-
-### The Flow
-
-```
-1. Push to `develop` (app-src/** changed)
-     → CI builds sha-<gitsha> ONCE, Trivy-scans it, pushes it, bumps values-dev.yaml
-     → Argo CD auto-syncs demo-app-dev (PreSync hook is disabled in dev, so it's instant)
-
-2. Verify in dev → run the "Promote Image" workflow manually:
-     target_env: test
-     image_tag: sha-<the tag currently in values-dev.yaml — copy it, don't retype from memory>
-     → it verifies the tag exists, bumps values-test.yaml, opens a PR: promote/test-sha-xxxxx → test
-     → review + merge that PR (no rebuild happened — same image, just a new reference)
-     → Argo CD auto-syncs demo-app-test
-     → the PreSync Job hook runs FIRST (sync-wave -1), THEN the Deployment updates
-
-3. QA signs off in test → run "Promote Image" again:
-     target_env: prod
-     image_tag: sha-<the SAME tag from values-test.yaml — the exact image QA verified>
-     release_version: v1.2.0
-     → it creates the v1.2.0 alias tag (same digest), resolves the digest,
-       bumps values-prod.yaml with BOTH, opens a PR: promote/prod-v1.2.0 → main
-     → review + merge (requires review + passing checks) → demo-app-prod shows
-       OutOfSync, but does NOT auto-apply
-
-4. A release manager reviews the diff:
-     argocd app diff demo-app-prod
-   then syncs deliberately:
-     argocd app sync demo-app-prod
-
-5. Argo Rollouts takes over from there — traffic shifts 20% → 50% → 100%,
-   pausing at each step. Watch it live:
-     kubectl argo rollouts get rollout demo-app-prod -n prod --watch
-
-6. If step 5 looks wrong at any point:
-     kubectl argo rollouts abort demo-app-prod -n prod
-   rolls back immediately to the last known-good version — no new Git commit needed.
-```
-
-### Test Deployment — Full Walkthrough (Step by Step)
-
-This is the same flow as above, zoomed in on `test` specifically, with the actual commands and what to check at every stage — written so a first-time reader can follow along without guessing.
-
-**Step 1 — Get a verified image into `dev` first**
-
-```bash
-git checkout develop
-# ... edit app-src/ ...
-git add app-src/
-git commit -m "some change"
-git push origin develop
-```
-
-This triggers `ci.yml`. Watch it in **GitHub → Actions → CI - Build, Scan & Deploy to Dev**. When it finishes, it has:
-- built exactly one image, tagged `sha-<7-char-commit-sha>`
-- Trivy-scanned it (fails the whole run if a fixable HIGH/CRITICAL CVE is found)
-- pushed it to Artifact Registry
-- bumped `apps/demo-app/values-dev.yaml`'s `image.tag` and pushed that commit back to `develop`
-
-```bash
-# Confirm the new tag actually landed
-git pull origin develop
-cat apps/demo-app/values-dev.yaml | grep tag
-```
-
-Argo CD's `demo-app-dev` Application auto-syncs (tracks `develop`, `automated: {prune: true, selfHeal: true}`) — within ~3 minutes (Argo CD's default Git polling interval) it deploys automatically. Confirm:
-
-```bash
+# ===== 6. Watch it deploy automatically to dev =====
 kubectl get application demo-app-dev -n argocd
 kubectl get pods -n dev
-```
 
-**Step 2 — Promote that exact image into `test` (no rebuild)**
-
-Copy the tag from Step 1, then in **GitHub → Actions → "Promote Image (Retag, Never Rebuild)" → Run workflow**:
-
-| Field | Value |
-|---|---|
-| target_env | `test` |
-| image_tag | the `sha-xxxxx` value from `values-dev.yaml` |
-| release_version | leave blank |
-
-Watch the run. It will:
-1. Verify that tag genuinely exists in Artifact Registry (fails loudly if you mistype it)
-2. Check whether `test` already points at this tag (skips cleanly if so — nothing to do)
-3. Bump `apps/demo-app/values-test.yaml`'s `image.tag`
-4. Push a uniquely-named branch and open a Pull Request into `test`
-
-**Step 3 — Review and merge the promotion PR**
-
-Go to **GitHub → Pull requests**. You'll see one titled `Promote to test: sha-xxxxx`. The diff should be exactly one line — the image tag in `values-test.yaml`. Merge it.
-
-**Step 4 — Argo CD picks up the merge and syncs `test`**
-
-`demo-app-test`'s Application tracks the `test` branch with `automated` sync — no manual `argocd app sync` needed. Within ~3 minutes:
-
-```bash
-kubectl get application demo-app-test -n argocd
-```
-
-You'll see the sync go through **two phases**, because `values-test.yaml` has `preSyncCheck.enabled: true`:
-
-```bash
-# Phase 1 — the PreSync hook Job runs FIRST (sync-wave: -1) and must
-# succeed before Argo CD touches anything else
-kubectl get jobs -n test
-kubectl logs -n test job/demo-app-test-presync-check
-
-# Phase 2 — only after that Job succeeds does the Deployment/Service/HPA
-# actually update to the new image
-kubectl get pods -n test -w
-```
-
-**Step 5 — Confirm it's actually running the promoted image**
-
-```bash
-kubectl get pods -n test -o jsonpath='{.items[0].spec.containers[0].image}'
-# should exactly match the sha-xxxxx tag you promoted in Step 2
-```
-
-If `demo-app-test` shows `Synced` + `Healthy` and the pod's image matches, the promotion worked end-to-end — same artifact that was in `dev`, now running in `test`, with zero rebuilds anywhere in the chain.
-
-### A Note on `root-app.yaml`
-
-Unlike `demo-app-dev`/`test`/`prod` (whose `source.targetRevision` follows the branch table above), `argocd-apps/root-app.yaml` itself always tracks `main` — because it defines the Argo CD **platform configuration** (which environments exist, their sync policies, RBAC boundaries). Changes to that shape deserve the same review rigor as a production release, regardless of which branch an individual app deployment is promoted through.
-
----
-
-## 9. Verification Commands
-
-```bash
-# Argo CD's view of the world
-kubectl get applications -n argocd
-argocd app get demo-app-dev
-argocd app get demo-app-prod
-
-# AppProjects and RBAC
-kubectl get appprojects -n argocd
-kubectl get cm argocd-rbac-cm -n argocd -o yaml
-
-# The actual workloads per namespace
-kubectl get deployments,pods,hpa -n dev
-kubectl get deployments,pods,hpa -n test
-kubectl get rollout,pods,hpa -n prod
-
-# Sync hooks
-kubectl get jobs -n test    # the PreSync check Job
-kubectl logs -n test job/demo-app-presync-check
-
-# Argo Rollouts canary status
-kubectl argo rollouts get rollout demo-app-prod -n prod
-
-# Namespace isolation
-kubectl get resourcequota -n dev
-kubectl get networkpolicy -n dev
-
-# Notifications
-kubectl get cm argocd-notifications-cm -n argocd -o yaml
-kubectl get secret argocd-notifications-secret -n argocd
+# ===== 7. Promote to test, then prod, whenever you're ready =====
+# GitHub -> Actions -> "Promote Image" -> Run workflow (see Part B above)
 ```
 
 ---
 
-## 10. Troubleshooting
+## 9. Bonus: What If We Had Separate GCP Accounts for Dev/Test/Prod?
 
-| # | Issue | Cause | Fix |
-|---|---|---|---|
-| 1 | `root-app` syncs but `demo-app-dev`/`test`/`prod` never appear | Repo URL in `root-app.yaml` still has a placeholder, or the repo isn't registered/reachable | Confirm `repoURL` matches your real GitHub URL exactly, and that the repo is public or has credentials registered |
-| 2 | `demo-app-prod` stuck `Progressing` forever | The PreSync hook Job failed, and Argo CD is waiting on it before touching the Rollout | `kubectl get jobs -n prod` then `kubectl logs job/<name> -n prod` to see why the hook failed |
-| 3 | Argo CD shows prod permanently `OutOfSync` even right after a sync | `ignoreDifferences` missing/misconfigured for the HPA-managed `spec/replicas` field | Confirm `prod-app.yaml`'s `ignoreDifferences` block targets the exact `group`/`kind`/`jsonPointers` of the resource actually drifting |
-| 4 | `kubectl apply -f argocd-projects/` fails with an RBAC/permission error from Argo CD itself, not Kubernetes | You're logged in as a user without `role:admin` in `argocd-rbac-cm` | Log in as `admin` (the bootstrap password) for initial setup; assign real users to `platform-admins` afterward |
-| 5 | Slack notifications never fire | `argocd-notifications-secret` missing, or the trigger's `when` condition doesn't match your app's actual `operationState.phase` values | `kubectl get secret argocd-notifications-secret -n argocd`; check `kubectl describe application demo-app-prod -n argocd` for the real phase values first |
-| 6 | Rollout resource rejected: `no matches for kind "Rollout"` | The Argo Rollouts CRDs/controller aren't installed yet | Confirm `bootstrap/argocd.tf`'s `helm_release.argo_rollouts` applied successfully: `kubectl get pods -n argo-rollouts` |
-| 7 | HPA shows `<unknown>` targets in prod | HPA is targeting `Deployment` but prod actually runs a `Rollout` (or vice versa) | Confirm `hpa.yaml`'s conditional `scaleTargetRef` matches `values-prod.yaml`'s `rollout.enabled` setting |
-| 8 | CI workflow fails at the Trivy scan step | A HIGH/CRITICAL vulnerability was found in the base image or a dependency | Update `app-src/requirements.txt`/base image version; this is an intentional gate, not a bug |
-| 9 | `argocd app sync demo-app-prod` says "permission denied" | Your Argo CD user isn't in the `release-managers` group/role | Check `argocd-rbac-cm.yaml`'s `g, gke-argocd-gitops:release-managers, role:release-manager` mapping against your actual logged-in identity |
-| 10 | ApplicationSet example accidentally creates duplicate Applications | Someone applied `applicationset-example.yaml` while `root-app.yaml`'s App-of-Apps is also active | Only ever run ONE pattern at a time — this repo defaults to App of Apps; delete/don't-apply the ApplicationSet file unless you've deliberately switched patterns |
-| 11 | CI fails at the "Authenticate to GCP" step with a token/audience error | GitHub secrets `GCP_WIF_PROVIDER`/`GCP_SERVICE_ACCOUNT` are missing, wrong, or copied from the **infra repo's** WIF setup instead of this repo's own (`bootstrap/wif.tf`) | Re-run `terraform output gitops_ci_wif_provider` and `terraform output gitops_ci_service_account_email` from THIS repo's `bootstrap/`, and re-paste them as secrets in THIS GitHub repo |
-| 12 | `terraform apply` fails: `The WorkloadIdentityPool's display name must be less than or equal to 32 characters` | GCP hard-limits `display_name` on this resource to 32 chars | Fixed in this repo's `wif.tf` — `display_name = "GitOps CI Pool"` (14 chars); the longer explanation moved into `description`, which has a much higher limit |
-| 13 | `helm_release.argocd` fails: `context deadline exceeded` / "Helm release was created but has a failed status" | Argo CD installs ~7 components; on a small/shared node pool (this cluster also runs WordPress) pulling every image and reaching Ready can take longer than Helm's 300s default | Fixed by setting `timeout = 600` and dropping `repoServer.replicas` to 1 in `argocd.tf`. If it STILL times out, run `kubectl get pods -n argocd` and `kubectl describe pod <pending-pod> -n argocd` to see the real reason (often `Insufficient cpu`/`Insufficient memory` on the node pool) |
-| 14 | Re-running `terraform apply` after a failed Argo CD install fails again immediately, or does nothing | Terraform's state still has `helm_release.argocd` recorded as failed/partially-created, so it won't cleanly retry | Clean up first: `helm uninstall argocd -n argocd` (safe — Argo CD's own CRDs have a `resource-policy: keep` annotation, so they survive), then `terraform apply` again for a fresh install |
-| 15 | `Warning: Helm uninstall returned an information message... resources were kept due to the resource policy` for the `applications.argoproj.io`/`applicationsets.argoproj.io`/`appprojects.argoproj.io` CRDs | This is **expected, not an error** — the Argo CD chart deliberately annotates its own CRDs with `helm.sh/resource-policy: keep`, so an `uninstall` never deletes existing `Application`/`AppProject` objects along with the controller | Safe to ignore. If you genuinely want to remove the CRDs too (e.g. tearing down the whole demo permanently): `kubectl delete crd applications.argoproj.io applicationsets.argoproj.io appprojects.argoproj.io` manually, afterward |
-| 16 | Several Argo CD pods stuck `Init:0/1` for many minutes, `argocd-server` shows `CreateContainerError`, liveness/readiness probes fail with `connection refused` | **Node resource starvation**, not a config bug — `kubectl describe nodes \| grep -A5 "Allocated resources"` shows CPU/memory requests already at ~90%+ before Argo CD even schedules. On a small/shared node pool (this cluster also runs WordPress), the default Argo CD chart's resource requests for ~7 components simply don't fit | Fixed in `argocd.tf`: `dex.enabled = false` (SSO isn't wired up yet — no reason to run an idle component), plus explicit, conservative `resources.requests/limits` set on every remaining component (`server`, `controller`, `repoServer`, `redis`, `notifications`, `applicationSet`) and on `argo-rollouts`. If pods are still stuck after re-applying, the node pool itself needs more capacity — resize it in the `gke-infra-terraform` repo (bigger machine type or more nodes), this repo can't fix a genuinely undersized cluster from the outside |
-| 17 | `demo-app-dev`/`test`/`prod` stuck `OutOfSync`/`Missing`, retrying automated sync repeatedly; `kubectl describe application` shows `resource :ServiceAccount is not permitted in project dev` (or similar for other kinds) | The corresponding `AppProject`'s `namespaceResourceWhitelist` doesn't list every Kubernetes kind the Helm chart actually creates — Argo CD silently blocks any kind not explicitly whitelisted, even if the chart is otherwise valid | Fixed — all three `argocd-projects/*.yaml` now whitelist `ServiceAccount` (created by `serviceaccount.yaml`) and `networking.gke.io/ManagedCertificate` (created by `ingress.yaml` when `ingress.enabled: true`), alongside the kinds already listed. General lesson: whenever a new template/resource kind is added to the Helm chart, the relevant AppProject's whitelist must be updated too, or Argo CD will block it with exactly this message |
-| 18 | Pod stuck `ImagePullBackOff`, event shows `failed to fetch oauth token... 404 Not Found` when pulling `.../demo-app/demo-app:dev-latest` | The Artifact Registry **repository itself** (`demo-app`) never existed — the infra repo's `artifact-registry` module only created `backup-images` (for the WordPress backup job), nothing for this project's demo app | Fixed — `bootstrap/artifact-registry.tf` in this repo now creates its own dedicated `demo-app` Docker repository (with a cleanup policy keeping the last 10 versions). Run `terraform apply` in `bootstrap/`, THEN push to `app-src/**` to trigger CI and actually populate an image at that tag |
-| 19 | Presync hook `Job` pod rejected: `forbidden: failed quota: test-quota: must specify limits.cpu...` (repeating hundreds of times over hours) | Once a namespace's `ResourceQuota` specifies `limits.*`, **every** pod in that namespace must explicitly declare `requests`/`limits` — the hook Job's `busybox` container didn't | Fixed — `presync-hook-job.yaml` now sets explicit `resources.requests/limits`. If you add any NEW pod-creating template later, it needs this too, or the same quota rejection happens again |
-| 20 | `demo-app-test` stuck `OutOfSync`/`Missing`, `kubectl describe application` shows `Operation State: ... waiting for completion of hook batch/Job/...` referencing a Job that no longer exists (`kubectl get jobs` shows nothing) | Argo CD's operation state got "stuck" pointing at a stale sync operation, usually after a hook resource was manually deleted mid-operation | `kubectl patch application <name> -n argocd --type json -p '[{"op": "remove", "path": "/operation"}]'` to force-clear the stuck operation, then `kubectl patch application <name> -n argocd --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'` to trigger a clean re-evaluation — both work via plain `kubectl`, no `argocd` CLI/port-forward needed |
-| 21 | Promoted a tag manually by typing it from memory (e.g. `dev-a1b2c3d`), and it never existed — `ImagePullBackOff` with `not found` | Manual `sed`-based promotion is error-prone; a fictional/example tag from documentation got typed in instead of the real one | Fixed — `promote.yml` now verifies the source tag actually exists in Artifact Registry via `gcloud artifacts docker images describe` and fails loudly BEFORE opening any PR, instead of silently shipping a typo three steps later |
+Right now, `dev`, `test`, and `prod` all live in **one GCP project** (`gke-prod-demo-001`), separated only by Kubernetes namespaces. This is common for smaller teams or personal projects, but many larger companies use **three separate GCP projects** — sometimes even three separate billing accounts — one per environment. Here's what would actually change.
 
----
+### What stays the SAME
 
-## 11. Interview Questions
+- The GitOps idea (Git as source of truth, Argo CD applying changes) doesn't change at all
+- The Helm chart (`apps/demo-app/`) doesn't change — same templates work anywhere
+- The branching strategy doesn't change
+- `promote.yml`'s idea (retag, never rebuild, open a PR) doesn't change
 
-**A. Fundamentals**
+### What actually changes
 
-1. **What is GitOps, in one sentence, and how does this repo embody it?**
-   GitOps means Git is the single source of truth for desired state, and a controller (Argo CD) continuously reconciles the live cluster to match it — nothing is ever `kubectl apply`'d by a human or a CI pipeline directly; CI only ever changes Git, Argo CD does the actual applying.
+| Thing | One-project setup (current) | Three-projects setup |
+|---|---|---|
+| **GKE clusters** | 1 cluster, 3 namespaces | Usually 3 separate clusters (or at least 3 separate node pools), one per project |
+| **Namespace isolation (`NetworkPolicy`, `ResourceQuota`)** | Needed, and we built it | **Not needed anymore** — projects are already fully separate, a `dev` VM/pod cannot even see `prod`'s network by default |
+| **Artifact Registry** | 1 registry, all environments pull from it | Usually 3 separate registries, OR 1 shared "build" project's registry with cross-project IAM read access granted to test/prod projects |
+| **Workload Identity Federation** | 1 pool trusting 2 repos, per-repo service accounts | Still similar, but now each environment's *deploy* identity (not just CI) needs project-specific permissions — e.g., a "prod deployer" service account that ONLY exists in the prod project |
+| **Argo CD** | 1 Argo CD installation, manages all 3 namespaces on 1 cluster | Argo CD is typically installed **once**, usually in a separate "platform" project/cluster, and connects OUTWARD to the 3 environment clusters using registered cluster credentials (`argocd cluster add`) |
+| **`Application`'s `destination`** | `namespace: dev` / `test` / `prod`, same `server: https://kubernetes.default.svc` | Each `Application`'s `destination.server` would point to a **different cluster's API endpoint** — this is the main YAML change needed |
+| **Terraform** | 1 `bootstrap/` project, 1 `terraform.tfvars` | Usually 3 sets of `.tfvars` (or 3 separate Terraform workspaces/state files) — one per project, since `project_id` itself differs per environment |
+| **IAM blast radius if compromised** | Limited by namespace RBAC + Kubernetes NetworkPolicy | Limited by GCP's own project boundary — much stronger, since a compromised dev project literally cannot reach prod's resources at the cloud-account level |
+| **Cost tracking** | All 3 environments' costs mixed in one GCP billing view | Each environment's cost is cleanly separated automatically — no tagging/labels needed to tell them apart |
 
-2. **What's the difference between `Application` and `AppProject`?**
-   `Application` = *what* to deploy and *where*. `AppProject` = the security/RBAC boundary a group of Applications must stay inside (allowed repos, allowed destination namespaces, allowed resource kinds, project-scoped roles).
+### The one thing that would need real, new work
 
-3. **Explain `syncPolicy.automated` vs leaving it out.**
-   With it: Argo CD applies Git changes immediately and (with `selfHeal`) reverts manual cluster edits back to match Git. Without it: Argo CD only computes/shows a diff; a human must trigger `sync` explicitly — this repo's prod uses exactly this for a deliberate manual gate.
+Argo CD's `Application.spec.destination.server` currently says `https://kubernetes.default.svc` (a special shortcut meaning "the same cluster Argo CD itself is running on"). With 3 separate clusters, we would first register each external cluster with Argo CD:
 
-4. **What do `prune: true` and `selfHeal: true` each individually control?**
-   `prune` removes resources from the cluster that were deleted from Git. `selfHeal` reverts resources that were changed directly in the cluster (e.g. via `kubectl edit`) back to match Git — they're independent switches, both usually enabled together for full automation.
+```bash
+argocd cluster add <context-name-for-prod-cluster>
+```
 
-**B. Sync Mechanics**
+Then update each environment's `Application` YAML to point `destination.server` at that specific cluster's real API URL instead of the shortcut. Everything else — the Helm chart, the branching, `promote.yml`, the sync policies — stays exactly the same.
 
-5. **Sync waves vs sync hooks — what's the actual difference?**
-   Waves order resources *within* the same sync operation (lower number first). Hooks run at specific *lifecycle phases* (`PreSync`/`Sync`/`PostSync`/`SyncFail`) outside the normal resource list, and Argo CD blocks the rest of the sync until a blocking hook completes. This repo's PreSync Job uses both concepts together.
+### In short
 
-6. **What does `hook-delete-policy: BeforeHookCreation` do, and why does the PreSync Job need it?**
-   It deletes the previous run of that hook resource before creating a new one on the next sync. Without it, re-syncing would try to create a `Job` with a name that already exists (Jobs are immutable once created) and fail.
-
-7. **What is `ignoreDifferences` for, and what's the risk of overusing it?**
-   It tells Argo CD to treat specific fields as expected drift (e.g. HPA-managed `replicas`) rather than `OutOfSync`. Overusing it can hide *real* drift you actually wanted to catch — it should be scoped as narrowly as possible (this repo targets one exact `jsonPointer`, not the whole resource).
-
-8. **How would you make Argo CD understand the health of a CRD it doesn't recognize?**
-   A custom health check — a small Lua script under `resource.customizations.health.<group>_<Kind>` in `argocd-cm`, returning a `Healthy`/`Degraded`/`Progressing` status based on that resource's own status fields (demonstrated here for `batch/Job`).
-
-**C. Progressive Delivery**
-
-9. **Why use Argo Rollouts instead of a plain Deployment for prod?**
-   A plain `Deployment`'s rolling update replaces all pods based only on readiness probes — it has no concept of gradually shifting *traffic* or pausing for analysis. A `Rollout`'s canary strategy shifts a percentage of traffic at a time, with pauses, so a bad release is caught while only affecting a fraction of real users.
-
-10. **What happens if a canary step looks wrong halfway through?**
-    `kubectl argo rollouts abort <name>` immediately stops the rollout and routes all traffic back to the last stable version — without needing a new Git commit or Argo CD sync.
-
-11. **Why does the HPA need a different `scaleTargetRef` for prod vs dev/test in this repo?**
-    Dev/test scale a plain `Deployment`; prod scales a `Rollout` (a different `apiVersion`/`kind` entirely) — the HPA's `scaleTargetRef` has to point at whichever object type actually owns the pods in that environment.
-
-**D. RBAC & Notifications**
-
-12. **Why does this repo have RBAC in two different places (`argocd-rbac-cm` and each `AppProject`)?**
-    They answer different questions: `argocd-rbac-cm` is global ("can this identity use Argo CD at all, and at what default level"), while each `AppProject`'s `roles` are scoped ("what can this identity do specifically inside this one project's Applications"). Real permission is the intersection/most-restrictive match of both.
-
-13. **How do notification triggers, templates, and subscriptions relate to each other?**
-    A trigger defines *when* to fire (a condition on `app.status`). A template defines *what* message to send. A subscription (via annotation on an Application, or the ConfigMap's global `subscriptions` block) defines *who* receives it and through *which* service (Slack, email, etc).
-
-**E. Patterns & Architecture**
-
-14. **App of Apps vs ApplicationSet — when would you choose each?**
-    App of Apps: few, genuinely different environments/apps needing individual field-level control (different sync policy, different notifications per app — as prod vs dev differ here). ApplicationSet: many near-identical targets where a single generator avoids repetitive, near-duplicate YAML.
-
-15. **Why does this repo's CI pipeline never run `kubectl apply` or `helm upgrade` directly?**
-    Because that would break GitOps entirely — the cluster's state would depend on two divergent sources (CI's imperative commands AND Git), instead of Git being the one source of truth Argo CD reconciles against.
-
-16. **How does a single GKE cluster safely host dev, test, and prod at once?**
-    Namespace-level isolation: separate namespaces, a `ResourceQuota` per namespace (hard CPU/memory/pod ceilings so one environment can't starve another), and a default-deny `NetworkPolicy` per namespace (so, e.g., a compromised dev pod can't reach a prod service over the network).
-
-17. **Why does this repo create its own Workload Identity Pool instead of reusing the infra repo's?**
-    Two reasons: (1) the infra repo's WIF *provider* has an `attribute_condition` that only trusts tokens from that specific repository — a token from this repo would be rejected before any IAM policy is even evaluated, so reusing it isn't even possible without editing the other repo's Terraform. (2) Least privilege — this repo's CI only ever needs to push a Docker image, so its dedicated service account only holds `roles/artifactregistry.writer`, nothing close to the infra repo's CI identity's broader permissions.
-
-18. **What does "build once, promote everywhere" mean, and why does rebuilding per environment violate it?**
-    It means the exact binary artifact that gets tested is the exact same artifact that reaches production — only its *reference* (which tag/digest an environment's values file points at) changes between environments. Rebuilding per environment (even from identical source) can produce a different result — a different base-image patch version pulled at build time, a different dependency resolved, a subtly different layer — so what got tested is no longer provably what ships. This repo's `promote.yml` only ever re-tags an already-built image; it never runs `docker build` again.
-
-19. **Why does `values-prod.yaml` pin by digest instead of just a version tag like `v1.2.0`?**
-    A tag is a mutable pointer — someone (or some automation) could push a new image and reuse the same tag name, silently changing what `v1.2.0` refers to. A digest (`sha256:...`) is a cryptographic hash of the image's actual content — it's physically impossible for two different images to share one digest. Prod pins the digest for a real, unfalsifiable guarantee of exactly what's running; the tag stays only as a human-readable label alongside it.
-
-20. **Why use a GitHub App instead of a personal access token (PAT) for the `demo-app` repo's cross-repo commit into `gke-argocd-gitops`?**
-    A fine-grained PAT is tied to a human account and GitHub *forces* it to have an expiry (max 1 year) — meaning it will eventually stop working on some date nobody's tracking, silently breaking the pipeline. A GitHub App is installed independently of any one person's account, and its workflow-facing "token" is actually generated fresh on every single run (short-lived, ~1 hour) from a private key that itself has no forced expiry — there's nothing to remember to rotate on a calendar, and its permissions/installation scope are centrally visible and revocable from the App's settings, unlike a PAT buried in one person's account settings.
+Multi-project setup is **more isolated and more secure by default**, at the cost of **more infrastructure to manage** (multiple clusters, multiple registries, more Terraform state). Our single-project + namespace-isolation approach is a completely reasonable choice for smaller teams, and everything we built here would still make sense as a foundation if we ever needed to grow into the multi-project model later.
 
 ---
 
-## 12. Future Improvements
+## 10. Common Problems and Fixes
 
-- [ ] Wire up SSO (Dex/OIDC via GitHub teams) so `argocd-rbac-cm`'s group mappings reflect real identities instead of a single shared `admin` login
-- [ ] Add an `AnalysisTemplate` (Argo Rollouts) so canary promotion is gated on real metrics (error rate, latency) instead of a fixed timer
-- [ ] Add a `trafficRouting` block (Istio/NGINX/SMI) to `rollout.yaml` for true HTTP-level traffic-percentage control instead of today's replica-ratio approximation
-- [ ] Add Argo CD's own Ingress + ManagedCertificate instead of `kubectl port-forward`
-- [ ] Add `argocd-image-updater` as an alternative to the CI-commits-a-tag-bump pattern currently used for dev
-- [ ] Add branch protection rules on `test`/`main` requiring PR review + passing status checks before merge (`main` = production, deserves the strictest rule)
-- [ ] Add a second GKE cluster and demonstrate ApplicationSet's cluster generator for genuine multi-cluster delivery
+| Problem | Likely Cause | Fix |
+|---|---|---|
+| Argo CD pods stuck `Init:0/1`, `CreateContainerError` | Node pool doesn't have enough CPU/memory | Check `kubectl describe nodes \| grep -A5 "Allocated resources"`; either resize the node pool or reduce component resource requests (already tuned down in `argocd.tf`) |
+| `Application` shows `resource X is not permitted in project` | The `AppProject`'s allowed-kinds list is missing that Kubernetes kind | Add it to the relevant `argocd-projects/*.yaml` file |
+| Promotion workflow fails: tag not found | Typed the tag from memory instead of copying it | Always copy the exact tag from the current environment's `values-*.yaml` |
+| `non-fast-forward` git push error in a workflow | Branch name collided with a leftover branch from a previous run | Fixed — `promote.yml` now uses a unique branch name per run (includes the run ID) |
+| GitHub Actions can't create a PR ("not permitted") | Repository setting blocks Actions from creating PRs | Repo Settings → Actions → General → enable "Allow GitHub Actions to create and approve pull requests" |
+| Cross-repo commit works today, breaks months later | A personal access token silently expired | We use a GitHub App instead — its tokens are generated fresh every run, nothing to expire on a schedule |
+| Prod pod ImagePullBackOff | The promoted tag doesn't actually exist yet, or the Artifact Registry repo itself was never created | Confirm the tag exists with `gcloud artifacts docker images describe`; confirm `bootstrap/artifact-registry.tf` was applied |
+
+---
+
+## 11. Interview Questions (Quick Reference)
+
+- What is GitOps, and how is it different from a normal CI/CD pipeline that runs `kubectl apply`?
+- Why do we split application code and deployment config into two repositories?
+- What is "build once, promote everywhere," and why does rebuilding per environment break that promise?
+- What's the difference between a Kubernetes `Deployment`'s rolling update and Argo Rollouts' canary strategy?
+- What is Workload Identity Federation, and why is it safer than a downloaded service account key?
+- Why does prod use manual sync while dev/test use automatic sync?
+- What is the difference between an Argo CD `Application` and an `AppProject`?
+- What is "App of Apps," and when would you use `ApplicationSet` instead?
+- Why use a GitHub App instead of a personal access token for cross-repo automation?
+- If you moved from one shared GCP project to three separate ones, what would actually need to change in this setup?
+
+*(Full detailed answers to these — and many more — were given earlier in this conversation.)*
