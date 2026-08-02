@@ -13,8 +13,8 @@ rollout:
     - setWeight: 100
 
 image:
-  tag: "v1.0.0"    # human-readable label, set by promote.yml — informational only once digest is set
-  digest: ""       # e.g. "sha256:abc123..." — set by promote.yml; THIS is what actually gets pulled
+  tag: "v1.0.0"
+  digest: "sha256:48511351b9a93ebc33a5e02ba3b6fb9d2e58aef995167c80230b48203d236b36"
 
 replicaCount: 3
 
