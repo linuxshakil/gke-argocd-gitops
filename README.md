@@ -573,6 +573,32 @@ Also, still in Settings → **Actions → General** → scroll to **Workflow per
 
 ---
 
+### STEP 7.5 — Get notified by email when a prod approval is needed
+
+Branch protection alone tells GitHub "someone must approve before this merges" — but nobody actually knows *when* to go approve unless they're notified. A `CODEOWNERS` file solves this: it automatically requests a specific person as a reviewer the moment a PR touches a sensitive file, and GitHub emails that person a "review requested" notification.
+
+1. Create `.github/CODEOWNERS` in the `gke-argocd-gitops` repo:
+
+```
+# Anything that changes what runs in production
+apps/demo-app/values-prod.yaml           @<your-github-username>
+argocd-apps/environments/prod-app.yaml   @<your-github-username>
+argocd-projects/prod-project.yaml        @<your-github-username>
+
+# Platform-level config changes deserve the same scrutiny as a prod release
+bootstrap/        @<your-github-username>
+argocd-config/    @<your-github-username>
+```
+
+2. Back on the `main` branch protection rule (Step 7), also check **"Require review from Code Owners"**
+3. Confirm your own email notifications are on: `github.com/settings/notifications` → **"Pull request reviews"** → make sure **Email** is checked
+
+**What this actually does:** the moment a PR (opened manually, or by `promote.yml`) touches any of the listed paths, GitHub automatically adds you as a required reviewer and sends you an email. The PR **cannot be merged** until you approve it — this isn't just a notification, it's an enforced gate. There's no practical limit on how many of these emails GitHub will send — each PR touching a protected path triggers its own notification, with no daily/monthly cap, since it's tied to your own account rather than a shared quota.
+
+> **Why not a custom email workflow (e.g. SMTP/Gmail) instead?** It was considered, but CODEOWNERS is the better production choice: zero secrets to store or rotate, it's an actual *enforced* merge gate rather than just an informational email, and it's GitHub's own infrastructure rather than a personal Gmail account's App Password sitting in a repo secret. A custom SMTP step only makes sense if the approver doesn't have (or shouldn't need) write/reviewer access on the repo at all.
+
+---
+
 ### STEP 8 — Apply Argo CD's own configuration
 
 ```bash
@@ -726,6 +752,7 @@ Multi-project setup is **more isolated and more secure by default**, at the cost
 | GitHub Actions can't create a PR ("not permitted") | Repository setting blocks Actions from creating PRs | Repo Settings → Actions → General → enable "Allow GitHub Actions to create and approve pull requests" |
 | Cross-repo commit works today, breaks months later | A personal access token silently expired | A GitHub App is used instead — its tokens are generated fresh every run, nothing to expire on a schedule |
 | Prod pod ImagePullBackOff | The promoted tag doesn't actually exist yet, or the Artifact Registry repo itself was never created | Confirm the tag exists with `gcloud artifacts docker images describe`; confirm `bootstrap/artifact-registry.tf` was applied |
+| No review-request email arrives when a prod PR opens | Either the `CODEOWNERS` username doesn't match the actual GitHub username exactly, or "Email" is turned off under Pull request reviews in personal notification settings | Double-check `.github/CODEOWNERS` uses the exact `@username` (case-sensitive); check `github.com/settings/notifications` |
 
 ---
 
