@@ -10,13 +10,14 @@ This README explains **everything** in this project, in simple words. If you are
 2. [The Two Repositories](#2-the-two-repositories)
 3. [Big Picture — How Everything Connects](#3-big-picture--how-everything-connects)
 4. [Part A: Terraform — Building the Foundation](#4-part-a-terraform--building-the-foundation)
-5. [Part B: GitHub Actions — The Automation](#5-part-b-github-actions--the-automation)
-6. [Part C: Argo CD — How Deployment Actually Happens](#6-part-c-argo-cd--how-deployment-actually-happens)
-7. [Branching Strategy](#7-branching-strategy)
-8. [Complete Step-by-Step Setup (From Zero)](#8-complete-step-by-step-setup-from-zero--full-hands-on-guide)
-9. [Bonus: What If This Project Used Separate GCP Accounts for Dev/Test/Prod?](#9-bonus-what-if-this-project-used-separate-gcp-accounts-for-devtestprod)
-10. [Common Problems and Fixes](#10-common-problems-and-fixes)
-11. [Interview Questions](#11-interview-questions-with-answers)
+5. [Part B: Helm — Packaging the App for Kubernetes](#5-part-b-helm--packaging-the-app-for-kubernetes)
+6. [Part C: GitHub Actions — The Automation](#6-part-c-github-actions--the-automation)
+7. [Part D: Argo CD — How Deployment Actually Happens](#7-part-d-argo-cd--how-deployment-actually-happens)
+8. [Branching Strategy](#8-branching-strategy)
+9. [Complete Step-by-Step Setup (From Zero)](#9-complete-step-by-step-setup-from-zero--full-hands-on-guide)
+10. [Bonus: What If This Project Used Separate GCP Accounts for Dev/Test/Prod?](#10-bonus-what-if-this-project-used-separate-gcp-accounts-for-devtestprod)
+11. [Common Problems and Fixes](#11-common-problems-and-fixes)
+12. [Interview Questions](#12-interview-questions-with-answers)
 
 ---
 
@@ -114,7 +115,7 @@ Terraform is **not** used here to create the GKE cluster itself — that cluster
 | | Also sets a limit on how much CPU/memory each namespace can use ("ResourceQuota") | So `dev` experiments can never accidentally eat all the resources and break `prod` |
 | | Also blocks network traffic between namespaces ("NetworkPolicy") | So a `dev` pod can never accidentally talk to a `prod` pod |
 | `argocd.tf` | Installs Argo CD itself, and Argo Rollouts (for advanced deployments), using Helm | This is the actual "brain" that watches the Git repo and deploys things |
-| `wif.tf` | Sets up a secure, passwordless way for GitHub Actions to talk to Google Cloud | Explained fully in Part B below |
+| `wif.tf` | Sets up a secure, passwordless way for GitHub Actions to talk to Google Cloud | Explained fully in Part C below |
 | `artifact-registry.tf` | Creates a storage space in Google Cloud for the Docker images | Every image that gets built needs somewhere to live |
 | `backend.tf` | Tells Terraform WHERE to save its own memory file (called "state") | So Terraform remembers what it already created, and doesn't create things twice |
 
@@ -131,7 +132,158 @@ Always read the `plan` output carefully before typing `apply` — this is your o
 
 ---
 
-## 5. Part B: GitHub Actions — The Automation
+## 5. Part B: Helm — Packaging the App for Kubernetes
+
+Before getting to GitHub Actions and Argo CD, it helps to understand **Helm**, because both of those depend on it. This section assumes zero prior Helm knowledge.
+
+### What problem does Helm solve?
+
+Kubernetes needs YAML files to know what to run — a `Deployment` YAML, a `Service` YAML, and so on. Writing these by hand for three environments (dev, test, prod) means either maintaining three almost-identical copies of every file, or copy-pasting and editing by hand every time something changes. Both are error-prone.
+
+**Helm solves this with templates and values.** Instead of three finished YAML files, there is **one template** with blanks in it, and **three small files that fill in those blanks differently** — one set of values for dev, one for test, one for prod.
+
+### The Parts of a Helm Chart
+
+A "chart" is just a folder with a specific structure. This project's chart lives at `apps/demo-app/`:
+
+```
+apps/demo-app/
+├── Chart.yaml              # basic info: chart name, version
+├── values.yaml              # DEFAULT values — used unless overridden
+├── values-dev.yaml           # overrides specific to dev
+├── values-test.yaml          # overrides specific to test
+├── values-prod.yaml          # overrides specific to prod
+└── templates/                # the actual Kubernetes YAML, with blanks
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── hpa.yaml
+    ├── ingress.yaml
+    ├── serviceaccount.yaml
+    ├── rollout.yaml
+    ├── presync-hook-job.yaml
+    └── _helpers.tpl
+```
+
+**`Chart.yaml`** — just metadata, nothing to configure here:
+
+```yaml
+apiVersion: v2
+name: demo-app
+version: 0.1.0
+appVersion: "1.0.0"
+```
+
+**`values.yaml`** — the base/default settings. A small piece of this project's actual file:
+
+```yaml
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+image:
+  repository: asia-south1-docker.pkg.dev/gke-prod-demo-001/demo-app/demo-app
+  tag: "latest"
+```
+
+**`values-dev.yaml`** — only the settings that need to be *different* for dev. Anything not listed here just falls back to `values.yaml`'s default:
+
+```yaml
+image:
+  tag: "sha-049a901"    # overrides the default "latest"
+
+resources:
+  requests:
+    cpu: 50m              # smaller than the default 100m — dev doesn't need much
+    memory: 64Mi
+```
+
+### How a Template Actually Works
+
+Inside `templates/deployment.yaml`, instead of a fixed number of replicas, there's a placeholder:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "demo-app.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+        - name: demo-app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+```
+
+Anything inside `{{ }}` is Helm's templating language. `.Values.replicaCount` means "go look up `replicaCount` in the values files, and put that value right here." When Helm combines this template with `values.yaml` + `values-dev.yaml`, the final, real YAML it produces looks like this:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app-dev
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: demo-app
+          image: "asia-south1-docker.pkg.dev/gke-prod-demo-001/demo-app/demo-app:sha-049a901"
+```
+
+Notice the image tag came from `values-dev.yaml` (`sha-049a901`), while `replicaCount` came from the base `values.yaml` (`1`), since `values-dev.yaml` didn't override it. **Whatever a specific values file sets, wins. Whatever it doesn't mention, falls back to the default.** This is the entire mechanism that lets one chart serve three different environments.
+
+### A Couple of Small Building Blocks Worth Knowing
+
+**`{{- if ... }}` — conditional blocks.** Some resources should only exist in some environments. `templates/rollout.yaml` only gets created when `rollout.enabled` is `true` (which is only the case in prod):
+
+```yaml
+{{- if .Values.rollout.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+...
+{{- end }}
+```
+
+For dev and test (where `rollout.enabled` is `false`), Helm skips this block entirely — a plain `Deployment` gets used instead (from `templates/deployment.yaml`, which has the opposite condition, `{{- if not .Values.rollout.enabled }}`).
+
+**`_helpers.tpl` — small reusable snippets.** Instead of typing the app's full name in every single template file, it's defined once:
+
+```yaml
+{{- define "demo-app.fullname" -}}
+{{- printf "%s-%s" .Chart.Name .Values.environment }}
+{{- end }}
+```
+
+Any template can now use `{{ include "demo-app.fullname" . }}` and get back `demo-app-dev`, `demo-app-test`, or `demo-app-prod` — automatically correct for whichever environment it's rendered for.
+
+### Trying It Out Locally (No Cluster Needed)
+
+Helm can render a chart to plain YAML without touching any cluster at all — useful for checking what a values file will actually produce before committing it:
+
+```bash
+cd apps/demo-app
+helm template . -f values-dev.yaml
+```
+
+This prints the exact YAML that would be applied — a good way to catch a typo in a values file before it ever reaches Argo CD.
+
+### Where Helm Fits Into This Project's Bigger Picture
+
+Two different things in this project both use Helm, in two different ways:
+
+1. **`bootstrap/argocd.tf`** uses Terraform's `helm_release` resource to install *other people's* charts (Argo CD's own chart, Argo Rollouts' chart) — nothing custom here, just installing existing software.
+2. **`apps/demo-app/`** is a chart written specifically for this project's own application. Argo CD's `argocd-repo-server` component (see Part D below) is the one that actually runs `helm template` on this chart, using whichever `values-<env>.yaml` file that environment's `Application` object points at.
+
+---
+
+## 6. Part C: GitHub Actions — The Automation
 
 This project uses **two different GitHub Actions workflows**, one in each repo, each doing a very different job.
 
@@ -166,7 +318,7 @@ This is called **"build once, promote everywhere."** If the app were rebuilt sep
 
 ---
 
-## 6. Part C: Argo CD — How Deployment Actually Happens
+## 7. Part D: Argo CD — How Deployment Actually Happens
 
 ### What is Argo CD, really?
 
@@ -226,7 +378,7 @@ kubectl argo rollouts abort demo-app-prod -n prod
 
 ---
 
-## 7. Branching Strategy
+## 8. Branching Strategy
 
 This project uses **different branching styles in each repo**, on purpose, because each repo has a different job.
 
@@ -259,7 +411,7 @@ The app repo answers the question "what is the current best code?" The deploymen
 
 ---
 
-## 8. Complete Step-by-Step Setup (From Zero) — Full Hands-On Guide
+## 9. Complete Step-by-Step Setup (From Zero) — Full Hands-On Guide
 
 This section is written for someone doing this for the very first time. Every click, every command, in the exact order they need to happen. Nothing is skipped.
 
@@ -522,7 +674,7 @@ You now have a fully working, professional GitOps pipeline running end to end.
 
 ---
 
-## 9. Bonus: What If This Project Used Separate GCP Accounts for Dev/Test/Prod?
+## 10. Bonus: What If This Project Used Separate GCP Accounts for Dev/Test/Prod?
 
 Right now, `dev`, `test`, and `prod` all live in **one GCP project** (`gke-prod-demo-001`), separated only by Kubernetes namespaces. This is common for smaller teams or personal projects, but many larger companies use **three separate GCP projects** — sometimes even three separate billing accounts — one per environment. Here's what would actually change.
 
@@ -563,7 +715,7 @@ Multi-project setup is **more isolated and more secure by default**, at the cost
 
 ---
 
-## 10. Common Problems and Fixes
+## 11. Common Problems and Fixes
 
 | Problem | Likely Cause | Fix |
 |---|---|---|
@@ -577,7 +729,7 @@ Multi-project setup is **more isolated and more secure by default**, at the cost
 
 ---
 
-## 11. Interview Questions (With Answers)
+## 12. Interview Questions (With Answers)
 
 **1. What is GitOps, and how is it different from a normal CI/CD pipeline that runs `kubectl apply`?**
 GitOps means Git is the single source of truth for what should be running, and a controller (Argo CD) continuously makes the cluster match it. A normal CI/CD pipeline typically runs `kubectl apply` or `helm upgrade` directly from the pipeline, which means the pipeline itself needs cluster credentials, and there's no automatic mechanism correcting the cluster if someone changes something manually afterward. With GitOps, the pipeline never touches the cluster at all — it only ever changes Git, and Argo CD does the actual applying and continuously re-checks that the cluster still matches Git.
