@@ -13,8 +13,8 @@ rollout:
     - setWeight: 100
 
 image:
-  tag: "v1.0.1"
-  digest: "sha256:5ede4b332ce64412365b8becb88d911a68658030553f84e01dc043512d9ea4f0"
+  tag: "v1.1.0"
+  digest: "sha256:29987af3a4bf20d9582f49804c8e4928b3ec82f18d7807d2283ced7158880071"
 
 replicaCount: 3
 
