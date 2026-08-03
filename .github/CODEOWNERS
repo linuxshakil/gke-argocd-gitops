@@ -1,0 +1,18 @@
+# Whenever a Pull Request changes any of the files listed below, GitHub
+# automatically requests a review from the listed owner(s), and (if their
+# GitHub notification settings have email enabled) sends them an email
+# saying "your review is requested."
+#
+# This is the ACTUAL approval gate for production — combined with the
+# branch protection rule "Require review from Code Owners" on `main`
+# (see README Section 8, Step 7), a PR touching these files literally
+# cannot be merged until the listed owner approves it.
+
+# Anything that changes what runs in production
+apps/demo-app/values-prod.yaml    @linuxshakil
+argocd-apps/environments/prod-app.yaml   @linuxshakil
+argocd-projects/prod-project.yaml   @linuxshakil
+
+# Platform-level config changes deserve the same scrutiny as a prod release
+bootstrap/   @linuxshakil
+argocd-config/   @linuxshakil
